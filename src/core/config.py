@@ -73,7 +73,7 @@ class UIConfig:
     width: int = 420
     height: int = 640
     always_on_top: bool = True
-    stealth_enabled: bool = True
+    stealth_enabled: bool = False  # off by default so the overlay is always visible first
     hotkey_toggle: str = "alt+h"
     hotkey_snip: str = "alt+s"
     hotkey_ask: str = "alt+enter"

@@ -23,12 +23,14 @@ WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_TOPMOST = 0x00000008
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_APPWINDOW = 0x00040000
 
 HWND_TOPMOST = -1
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+SWP_FRAMECHANGED = 0x0020
 
 LWA_ALPHA = 0x00000002
 
@@ -85,6 +87,9 @@ class _WinAPI:
             ]
             self.user32.SetWindowPos.restype = wintypes.BOOL
 
+            self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            self.user32.IsWindowVisible.restype = wintypes.BOOL
+
             self.available = True
         except Exception:  # noqa: BLE001
             log.exception("Failed to bind Win32 APIs")
@@ -96,15 +101,31 @@ _API = _WinAPI()
 
 def hwnd_from_qt(widget: Any) -> int:
     """Extract native HWND from a Qt widget."""
-    wid = int(widget.winId())
-    return wid
+    return int(widget.winId())
+
+
+def refresh_frame(hwnd: int) -> None:
+    """Force DWM to pick up extended-style changes."""
+    if not _API.available:
+        return
+    _API.user32.SetWindowPos(
+        wintypes.HWND(hwnd),
+        wintypes.HWND(0),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
 
 
 def set_exclude_from_capture(hwnd: int, enabled: bool = True) -> bool:
     """
     Apply WDA_EXCLUDEFROMCAPTURE so the window is invisible to screen-share
-    capture APIs (Zoom, Teams, Meet, Discord Desktop Capture, etc.) while
-    remaining visible on the local desktop.
+    capture APIs while remaining visible on the local desktop.
+
+    IMPORTANT: Do not combine this with SetLayeredWindowAttributes(LWA_ALPHA).
+    That pairing makes the window invisible to the local user on many Win10/11 builds.
     """
     if not _API.available:
         log.warning("SetWindowDisplayAffinity unavailable on this platform")
@@ -114,7 +135,6 @@ def set_exclude_from_capture(hwnd: int, enabled: bool = True) -> bool:
     if not ok:
         err = ctypes.get_last_error()
         log.error("SetWindowDisplayAffinity failed (err=%s) hwnd=%s", err, hwnd)
-        # Fallback to WDA_MONITOR on older builds
         if enabled:
             ok = bool(_API.user32.SetWindowDisplayAffinity(wintypes.HWND(hwnd), WDA_MONITOR))
             if ok:
@@ -136,20 +156,24 @@ def set_window_topmost(hwnd: int, topmost: bool = True) -> bool:
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
     )
 
 
 def set_layered_alpha(hwnd: int, opacity: float) -> bool:
-    """opacity in [0.0, 1.0] -> Win32 alpha byte."""
+    """
+    opacity in [0.0, 1.0] -> Win32 alpha byte.
+
+    Avoid calling this while WDA_EXCLUDEFROMCAPTURE is active.
+    """
     if not _API.available:
         return False
     alpha = max(0, min(255, int(opacity * 255)))
-    # Ensure WS_EX_LAYERED
     style = _API.user32.GetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE)
     if not (style & WS_EX_LAYERED):
         _API.user32.SetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE, style | WS_EX_LAYERED)
+        refresh_frame(hwnd)
     return bool(
         _API.user32.SetLayeredWindowAttributes(
             wintypes.HWND(hwnd), 0, alpha, LWA_ALPHA
@@ -157,13 +181,33 @@ def set_layered_alpha(hwnd: int, opacity: float) -> bool:
     )
 
 
-def enable_tool_window(hwnd: int) -> bool:
-    """Hide from taskbar / Alt-Tab via WS_EX_TOOLWINDOW."""
+def force_opaque_layered(hwnd: int) -> bool:
+    """
+    If the window is layered, force alpha=255 so content is locally visible.
+    Safe to call alongside WDA_EXCLUDEFROMCAPTURE.
+    """
     if not _API.available:
         return False
     style = _API.user32.GetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE)
-    style = (style | WS_EX_TOOLWINDOW | WS_EX_LAYERED) & ~0x00040000  # clear WS_EX_APPWINDOW
+    if not (style & WS_EX_LAYERED):
+        return True
+    return bool(
+        _API.user32.SetLayeredWindowAttributes(
+            wintypes.HWND(hwnd), 0, 255, LWA_ALPHA
+        )
+    )
+
+
+def enable_tool_window(hwnd: int) -> bool:
+    """Hide from taskbar / Alt-Tab via WS_EX_TOOLWINDOW (does not force layered)."""
+    if not _API.available:
+        return False
+    style = _API.user32.GetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE)
+    style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    # Clear click-through if it was somehow set
+    style &= ~WS_EX_TRANSPARENT
     _API.user32.SetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE, style)
+    refresh_frame(hwnd)
     return True
 
 
@@ -175,6 +219,6 @@ def set_click_through(hwnd: int, enabled: bool) -> bool:
         style |= WS_EX_TRANSPARENT | WS_EX_LAYERED
     else:
         style &= ~WS_EX_TRANSPARENT
-        style |= WS_EX_LAYERED
     _API.user32.SetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE, style)
+    refresh_frame(hwnd)
     return True
