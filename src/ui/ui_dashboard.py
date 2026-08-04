@@ -66,7 +66,8 @@ class OverlayDashboard(QWidget):
         self._drag_pos = None
         self._snip = SnippingWidget()
         self._snip.regionSelected.connect(self._on_region_selected)
-        self._auto_ask_armed = True
+        # Auto-ask is owned by AIOrchestrator (triggers on interviewer prompts,
+        # not only '?'). Do NOT also fire ask_ai here — that caused races.
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
@@ -228,12 +229,23 @@ class OverlayDashboard(QWidget):
         splitter.setSizes([320, 320])
         shell_layout.addWidget(splitter, 1)
 
-        # OCR peek (compact, does not steal the main split)
+        # OCR peek (compact)
         self.ocr_view = QTextEdit()
         self.ocr_view.setReadOnly(True)
-        self.ocr_view.setMaximumHeight(72)
+        self.ocr_view.setMaximumHeight(56)
         self.ocr_view.setPlaceholderText("OCR region text (optional)…")
         shell_layout.addWidget(self.ocr_view)
+
+        # Pipeline / API diagnostic log (shows Groq/Gemini failures in-UI)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumHeight(64)
+        self.log_view.setPlaceholderText("Pipeline log — API errors and diarization notes appear here…")
+        self.log_view.setStyleSheet(
+            "QTextEdit{background:#140E0E;color:#FFB4B4;border:1px solid #4A3030;"
+            "border-radius:6px;font-size:11px;}"
+        )
+        shell_layout.addWidget(self.log_view)
 
         # Ask row
         ask_row = QHBoxLayout()
@@ -252,7 +264,8 @@ class OverlayDashboard(QWidget):
 
         hint = QLabel(
             "Hotkeys: Alt+H hide · Alt+S snip · Alt+Enter ask  |  "
-            "Blue = Interviewer · Grey = You · Bottom = AI stream"
+            "Blue = Interviewer · Grey = You · Bottom = AI  |  "
+            "AI auto-runs on interviewer prompts (echo-filtered)"
         )
         hint.setObjectName("StatusLabel")
         shell_layout.addWidget(hint)
@@ -266,22 +279,22 @@ class OverlayDashboard(QWidget):
         print(f"[UI TEXT APPENDED] ← interviewer slot text={text[:100]!r}", flush=True)
         self.conversation.append_interviewer(text)
         self._persist_transcript("interviewer", text)
-        # Auto-ask on questions
-        if self._auto_ask_armed and text.strip().endswith("?") and not CTX.is_ai_streaming:
-            self.mode.setCurrentText("auto")
-            self.ask_ai()
+        self._append_log(f"INTERVIEWER: {text[:120]}")
+        # Auto Gemini trigger lives in AIOrchestrator.record_interviewer()
 
     @pyqtSlot(str)
     def _on_candidate_text(self, text: str) -> None:
         print(f"[UI TEXT APPENDED] ← candidate slot text={text[:100]!r}", flush=True)
         self.conversation.append_candidate(text)
         self._persist_transcript("candidate", text)
+        self._append_log(f"CANDIDATE: {text[:120]}")
 
     @pyqtSlot()
     def _on_ai_started(self) -> None:
         print("[UI TEXT APPENDED] ← ai_started", flush=True)
         self.ai_view.begin_stream()
         self._on_status("Thinking…")
+        self._append_log("GEMINI stream started")
 
     @pyqtSlot(str)
     def _on_ai_chunk(self, chunk: str) -> None:
@@ -291,11 +304,23 @@ class OverlayDashboard(QWidget):
     def _on_ai_complete(self, text: str, latency_ms: float) -> None:
         self.ai_view.finalize(text or None)
         self._on_status(f"Answer ready ({latency_ms:.0f} ms)")
+        self._append_log(f"GEMINI complete ({latency_ms:.0f} ms, {len(text or '')} chars)")
 
     @pyqtSlot(str)
     def _on_ai_error(self, message: str) -> None:
         self.ai_view.show_error(message)
         self._on_status(message)
+        self._append_log(f"ERROR: {message}")
+
+    def _append_log(self, line: str) -> None:
+        if not hasattr(self, "log_view"):
+            return
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_view.append(f"{stamp}  {line}")
+        bar = self.log_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     @pyqtSlot(str)
     def _on_ocr_text(self, text: str) -> None:
@@ -324,6 +349,12 @@ class OverlayDashboard(QWidget):
         self.conversation.clear()
         self.ai_view.begin_stream()
         self.ai_view.browser.clear()
+        if hasattr(self, "log_view"):
+            self.log_view.clear()
+        try:
+            self.ai.memory.clear()
+        except Exception:  # noqa: BLE001
+            pass
         print("[UI TEXT APPENDED] feeds cleared", flush=True)
 
     # ---- interactions ----

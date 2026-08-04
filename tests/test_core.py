@@ -136,3 +136,29 @@ def test_markdown_to_html_code_fence() -> None:
     assert "<pre" in html
     assert "print(1)" in html
     assert "<b>Done</b>" in html
+
+
+def test_echo_similarity_and_interviewer_prompt() -> None:
+    from src.utils.text_similarity import text_similarity
+    from src.services.ai_orchestrator import looks_like_interviewer_prompt
+
+    a = "write a code in C++ and insert a node in Linux"
+    b = "write a code in C++ and insert a node in Linux."
+    assert text_similarity(a, b) >= 0.9
+    assert looks_like_interviewer_prompt(a) is True
+    assert looks_like_interviewer_prompt("ok") is False
+    assert looks_like_interviewer_prompt("What is a mutex?") is True
+
+
+def test_conversation_memory_last_n() -> None:
+    from src.services.ai_orchestrator import ConversationMemory
+
+    mem = ConversationMemory(maxlen=5)
+    mem.append("[INTERVIEWER]", "Explain quicksort")
+    mem.append("[CANDIDATE]", "Sure")
+    mem.append("[INTERVIEWER]", "write a code in C++")
+    block = mem.last_n(10)
+    assert "[INTERVIEWER]" in block
+    assert "[CANDIDATE]" in block
+    assert "quicksort" in block
+    assert "C++" in block
