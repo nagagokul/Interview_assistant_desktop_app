@@ -58,10 +58,13 @@ class AudioCaptureService:
         return self.pipeline.list_devices()
 
     def start(self) -> None:
+        print("[AUDIO CAPTURED] AudioCaptureService.start()", flush=True)
         self.pipeline.start()
         CTX.is_listening = self.pipeline.running
+        print(f"[AUDIO CAPTURED] running={self.pipeline.running}", flush=True)
 
     def stop(self) -> None:
+        print("[AUDIO CAPTURED] AudioCaptureService.stop()", flush=True)
         self.pipeline.stop()
         CTX.is_listening = False
 
