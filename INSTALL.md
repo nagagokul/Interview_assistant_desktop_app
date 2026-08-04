@@ -89,7 +89,13 @@ dist\InterviewCopilot\.env
 
 Double-click `InterviewCopilot.exe`. A tray icon appears; the frameless overlay floats on top.
 
-## 5. First-Session Checklist
+## 5. How to use (after install)
+
+Full walkthrough with overlay map, hotkeys, interview workflow, modes, and checklist:
+
+➡️ **[USAGE.md](USAGE.md)**
+
+### First-session checklist
 
 | Step | Action | Hotkey |
 |------|--------|--------|
