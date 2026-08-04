@@ -178,3 +178,45 @@ def test_split_default_device_input_output_pair() -> None:
     # Without sounddevice, resolvers still return None safely
     assert resolve_mic_device(4) == 4
     assert resolve_loopback_device(9) == 9
+
+
+def test_no_wasapi_settings_loopback_kwarg_in_source() -> None:
+    """Regression: sounddevice 0.5.x crashes on WasapiSettings(loopback=True)."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src"
+    call_re = re.compile(r"WasapiSettings\s*\([^)]*\bloopback\s*=")
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        # Ignore comments / docstrings that mention the forbidden pattern
+        code_lines = []
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            code_lines.append(line)
+        code = "\n".join(code_lines)
+        if call_re.search(code):
+            offenders.append(str(path.relative_to(root.parent)))
+    assert offenders == [], f"Invalid WasapiSettings(loopback=) in: {offenders}"
+
+
+def test_resample_mono_identity_and_downsample() -> None:
+    from src.utils.wasapi_loopback import resample_mono_f32
+
+    x = np.linspace(-0.5, 0.5, 160, dtype=np.float32)
+    assert resample_mono_f32(x, 16000, 16000).shape == (160,)
+    y = resample_mono_f32(x, 48000, 16000)
+    assert 50 <= len(y) <= 60
+
+
+def test_open_wasapi_loopback_raises_without_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.utils.wasapi_loopback as wl
+
+    monkeypatch.setattr(wl, "open_loopback_pyaudiowpatch", lambda target_rate=16000: None)
+    monkeypatch.setattr(wl, "open_loopback_soundcard", lambda target_rate=16000: None)
+    monkeypatch.setattr(wl, "open_loopback_stereo_mix", lambda target_rate=16000: None)
+    with pytest.raises(RuntimeError, match="WASAPI loopback"):
+        wl.open_wasapi_loopback()

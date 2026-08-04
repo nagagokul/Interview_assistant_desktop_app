@@ -14,6 +14,9 @@ mss>=9.0.1
 dxcam>=0.0.5; platform_system=="Windows"
 pytesseract>=0.3.10
 sounddevice>=0.4.6
+# Windows WASAPI loopback (sounddevice WasapiSettings has NO loopback= kwarg)
+PyAudioWPatch>=0.2.12.6; platform_system=="Windows"
+soundcard>=0.4.2; platform_system=="Windows"
 groq>=0.9.0
 google-genai>=0.3.0
 pypdf>=4.0.0

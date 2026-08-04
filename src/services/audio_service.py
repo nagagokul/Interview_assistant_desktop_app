@@ -1,8 +1,22 @@
 """
-Compatibility facade: AudioCaptureService → AudioPipeline.
+Audio capture facade → AudioPipeline.
 
-Prefer AudioPipeline directly. This wrapper keeps older call sites working
-(start/stop/running/list_devices/rolling_context).
+WASAPI loopback notes (Windows 10/11)
+-------------------------------------
+sounddevice 0.5.x ``WasapiSettings`` does **not** accept ``loopback=True``.
+Passing that keyword crashed Listen with:
+
+    WasapiSettings.__init__() got an unexpected keyword argument 'loopback'
+
+Real system-audio capture is implemented in ``src.utils.wasapi_loopback``:
+
+  1. PyAudioWPatch — WASAPI loopback devices as true inputs
+  2. soundcard     — include_loopback=True on the default speaker
+  3. Stereo Mix    — normal sounddevice InputStream + WasapiSettings(exclusive=False)
+
+Interviewer + candidate streams run on isolated QThreads. Stream init failures
+emit ``error_occurred`` / ``pipeline_error`` back to the GUI and never leave
+``running=True`` with a dead capture loop.
 """
 
 from __future__ import annotations
@@ -59,14 +73,30 @@ class AudioCaptureService:
 
     def start(self) -> None:
         print("[AUDIO CAPTURED] AudioCaptureService.start()", flush=True)
-        self.pipeline.start()
+        try:
+            self.pipeline.start()
+        except Exception as exc:  # noqa: BLE001
+            # Belt-and-suspenders: pipeline.start() already catches internally,
+            # but never let Listen take down the Qt event loop.
+            msg = f"Failed to start audio pipeline: {exc}"
+            log.exception(msg)
+            print(f"[PIPELINE ERROR] {msg}", flush=True)
+            self._on_error(msg)
+            CTX.is_listening = False
+            return
         CTX.is_listening = self.pipeline.running
         print(f"[AUDIO CAPTURED] running={self.pipeline.running}", flush=True)
 
     def stop(self) -> None:
         print("[AUDIO CAPTURED] AudioCaptureService.stop()", flush=True)
-        self.pipeline.stop()
-        CTX.is_listening = False
+        try:
+            self.pipeline.stop()
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Failed to stop audio pipeline: {exc}"
+            log.exception(msg)
+            self._on_error(msg)
+        finally:
+            CTX.is_listening = False
 
     def _on_interviewer(self, text: str) -> None:
         line = f"[INTERVIEWER] {text}"
@@ -93,7 +123,6 @@ class AudioCaptureService:
         print(f"[PIPELINE ERROR] {message}", flush=True)
         if self.hub is not None:
             # Do NOT send to ai_error (that paints the AI guidance panel).
-            # Status + UI log strip via status signal is enough.
             self.hub.emit_status(message)
 
     def _on_status(self, message: str) -> None:

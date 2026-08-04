@@ -26,6 +26,7 @@ from src.core.logging_setup import get_logger
 from src.utils.audio_devices import resolve_loopback_device, resolve_mic_device
 from src.utils.text_similarity import text_similarity
 from src.utils.vad import RingPCMBuffer, VoiceActivityDetector, pcm16_to_wav
+from src.utils.wasapi_loopback import LoopbackHandle, open_wasapi_loopback, resample_mono_f32
 
 log = get_logger("audio_pipeline")
 
@@ -36,6 +37,7 @@ def _utcnow_stamp() -> str:
 
 # Back-compat alias used by tests / callers
 _similarity = text_similarity
+_resample_mono_f32 = resample_mono_f32
 
 
 class GroqWhisperClient:
@@ -84,6 +86,7 @@ class _CaptureWorker(QThread):
 
     utterance_ready = pyqtSignal(str, bytes)  # tag, pcm
     capture_error = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)  # GUI-safe alias (QueuedConnection)
     capture_status = pyqtSignal(str)
 
     def __init__(
@@ -105,16 +108,142 @@ class _CaptureWorker(QThread):
     def stop(self) -> None:
         self._stop.set()
 
+    def _emit_error(self, msg: str) -> None:
+        print(f"[AUDIO CAPTURED] ERROR {msg}", flush=True)
+        self.capture_error.emit(msg)
+        self.error_occurred.emit(msg)
+
     def run(self) -> None:
+        cfg = self.config
+        role = "WASAPI_LOOPBACK" if self.loopback else "MICROPHONE"
+        print(
+            f"[AUDIO CAPTURED] START tag={self.tag} role={role} device={self.device} "
+            f"sr={cfg.sample_rate} thread={threading.current_thread().name}",
+            flush=True,
+        )
+        try:
+            if self.loopback:
+                self._run_loopback(cfg, role)
+            else:
+                self._run_microphone(cfg, role)
+        except Exception as exc:  # noqa: BLE001
+            # Last-resort safety net — never crash the GUI / orphan running=True
+            msg = f"Capture worker crashed {self.tag}: {exc}"
+            log.exception(msg)
+            self._emit_error(msg)
+        finally:
+            print(f"[AUDIO CAPTURED] STOP tag={self.tag}", flush=True)
+
+    def _process_mono_chunk(
+        self,
+        mono_f32: np.ndarray,
+        *,
+        vad: VoiceActivityDetector,
+        ring: RingPCMBuffer,
+        role: str,
+        cfg: AudioConfig,
+    ) -> None:
+        clipped = np.clip(mono_f32.astype(np.float32, copy=False), -1.0, 1.0)
+        pcm = (clipped * 32767.0).astype(np.int16).tobytes()
+
+        arr = np.frombuffer(pcm, dtype=np.int16)
+        if arr.size:
+            rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+            if rms < 180:
+                pcm = b"\x00\x00" * arr.size
+
+        result = vad.process(pcm)
+        if result.is_speech or vad.in_utterance:
+            ring.append(pcm)
+
+        if vad.should_finalize() and len(ring) > 0:
+            blob = ring.dump()
+            min_bytes = int(cfg.sample_rate * (cfg.min_utterance_ms / 1000.0) * 2)
+            vad.reset()
+            if len(blob) < min_bytes:
+                return
+            a2 = np.frombuffer(blob, dtype=np.int16)
+            rms2 = float(np.sqrt(np.mean(a2.astype(np.float32) ** 2))) if a2.size else 0.0
+            if rms2 < 120:
+                print(
+                    f"[AUDIO CAPTURED] pruned silent chunk tag={self.tag} rms={rms2:.1f}",
+                    flush=True,
+                )
+                return
+            print(
+                f"[AUDIO CAPTURED] utterance tag={self.tag} role={role} "
+                f"bytes={len(blob)} rms={rms2:.1f}",
+                flush=True,
+            )
+            self.utterance_ready.emit(self.tag, blob)
+
+    def _flush_ring(self, vad: VoiceActivityDetector, ring: RingPCMBuffer) -> None:
+        if vad.in_utterance and len(ring) > 0:
+            blob = ring.dump()
+            if blob:
+                self.utterance_ready.emit(self.tag, blob)
+
+    def _run_loopback(self, cfg: AudioConfig, role: str) -> None:
+        """
+        Interviewer path: open a real WASAPI loopback source.
+
+        NEVER call sounddevice.WasapiSettings with a loopback keyword — invalid on 0.5.x.
+        Speakers (in=0 out=2) cannot be opened as InputStream; use PyAudioWPatch /
+        soundcard / Stereo Mix via open_wasapi_loopback().
+        """
+        handle: LoopbackHandle | None = None
+        try:
+            handle = open_wasapi_loopback(target_rate=cfg.sample_rate)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Failed to enable WASAPI loopback: {exc}"
+            self._emit_error(msg)
+            return
+
+        self.capture_status.emit(f"{self.tag} capturing ({role} via {handle.name})")
+        print(
+            f"[AUDIO CAPTURED] loopback handle={handle.name} "
+            f"native_sr={handle.sample_rate} ch={handle.channels}",
+            flush=True,
+        )
+
+        vad = VoiceActivityDetector(
+            sample_rate=cfg.sample_rate,
+            frame_ms=cfg.chunk_ms,
+            aggressiveness=cfg.vad_aggressiveness,
+            silence_hangover_ms=cfg.silence_hangover_ms,
+        )
+        ring = RingPCMBuffer(cfg.max_utterance_ms, cfg.sample_rate)
+        # Read at native rate, then resample to cfg.sample_rate for VAD/Whisper
+        native_block = max(1, int(handle.sample_rate * cfg.chunk_ms / 1000))
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    mono_native = handle.read(native_block)
+                except Exception as exc:  # noqa: BLE001
+                    msg = f"Loopback read failed {self.tag}: {exc}"
+                    self._emit_error(msg)
+                    break
+                mono = resample_mono_f32(mono_native, handle.sample_rate, cfg.sample_rate)
+                if mono.size == 0:
+                    self._stop.wait(0.01)
+                    continue
+                self._process_mono_chunk(mono, vad=vad, ring=ring, role=role, cfg=cfg)
+            self._flush_ring(vad, ring)
+        finally:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run_microphone(self, cfg: AudioConfig, role: str) -> None:
+        """Candidate path: sounddevice InputStream on the microphone only."""
         try:
             import sounddevice as sd
         except Exception as exc:  # noqa: BLE001
-            msg = f"sounddevice unavailable for {self.tag}: {exc}"
-            print(f"[AUDIO CAPTURED] ERROR {msg}", flush=True)
-            self.capture_error.emit(msg)
+            self._emit_error(f"sounddevice unavailable for {self.tag}: {exc}")
             return
 
-        cfg = self.config
         vad = VoiceActivityDetector(
             sample_rate=cfg.sample_rate,
             frame_ms=cfg.chunk_ms,
@@ -123,12 +252,6 @@ class _CaptureWorker(QThread):
         )
         ring = RingPCMBuffer(cfg.max_utterance_ms, cfg.sample_rate)
         blocksize = int(cfg.sample_rate * cfg.chunk_ms / 1000)
-        role = "WASAPI_LOOPBACK" if self.loopback else "MICROPHONE"
-        print(
-            f"[AUDIO CAPTURED] START tag={self.tag} role={role} device={self.device} "
-            f"sr={cfg.sample_rate} thread={threading.current_thread().name}",
-            flush=True,
-        )
         self.capture_status.emit(f"{self.tag} capturing ({role})")
 
         def _callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:  # noqa: ARG001
@@ -136,60 +259,20 @@ class _CaptureWorker(QThread):
                 raise sd.CallbackStop()
             if status:
                 log.debug("%s stream status: %s", self.tag, status)
-
             # Strict mono from channel 0 only — never mix channels
             mono = indata[:, 0] if indata.ndim > 1 else indata
-            clipped = np.clip(mono, -1.0, 1.0)
-            pcm = (clipped * 32767.0).astype(np.int16).tobytes()
+            self._process_mono_chunk(mono, vad=vad, ring=ring, role=role, cfg=cfg)
 
-            # Soft noise gate
-            arr = np.frombuffer(pcm, dtype=np.int16)
-            if arr.size:
-                rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if rms < 180:
-                    pcm = b"\x00\x00" * arr.size
-
-            result = vad.process(pcm)
-            if result.is_speech or vad.in_utterance:
-                ring.append(pcm)
-
-            if vad.should_finalize() and len(ring) > 0:
-                blob = ring.dump()
-                min_bytes = int(cfg.sample_rate * (cfg.min_utterance_ms / 1000.0) * 2)
-                vad.reset()
-                if len(blob) >= min_bytes:
-                    # Prune near-silent blobs
-                    a2 = np.frombuffer(blob, dtype=np.int16)
-                    rms2 = float(np.sqrt(np.mean(a2.astype(np.float32) ** 2))) if a2.size else 0.0
-                    if rms2 < 120:
-                        print(
-                            f"[AUDIO CAPTURED] pruned silent chunk tag={self.tag} rms={rms2:.1f}",
-                            flush=True,
-                        )
-                        return
-                    print(
-                        f"[AUDIO CAPTURED] utterance tag={self.tag} role={role} "
-                        f"bytes={len(blob)} rms={rms2:.1f}",
-                        flush=True,
-                    )
-                    self.utterance_ready.emit(self.tag, blob)
-
+        # Shared-mode WASAPI only — never pass loopback= into WasapiSettings
         extra = None
-        if self.loopback:
+        if hasattr(sd, "WasapiSettings"):
             try:
-                if hasattr(sd, "WasapiSettings"):
-                    extra = sd.WasapiSettings(loopback=True)
-                    print(f"[AUDIO CAPTURED] WASAPI loopback enabled tag={self.tag}", flush=True)
-                else:
-                    msg = "WasapiSettings missing — loopback unavailable on this build"
-                    print(f"[AUDIO CAPTURED] ERROR {msg}", flush=True)
-                    self.capture_error.emit(msg)
-                    return
-            except Exception as exc:  # noqa: BLE001
-                msg = f"Failed to enable WASAPI loopback: {exc}"
-                print(f"[AUDIO CAPTURED] ERROR {msg}", flush=True)
-                self.capture_error.emit(msg)
-                return
+                extra = sd.WasapiSettings(exclusive=False, auto_convert=True)
+            except TypeError:
+                try:
+                    extra = sd.WasapiSettings(exclusive=False)
+                except Exception:  # noqa: BLE001
+                    extra = None
 
         try:
             with sd.InputStream(
@@ -203,17 +286,11 @@ class _CaptureWorker(QThread):
             ):
                 while not self._stop.is_set():
                     self._stop.wait(0.15)
-            if vad.in_utterance and len(ring) > 0:
-                blob = ring.dump()
-                if blob:
-                    self.utterance_ready.emit(self.tag, blob)
+            self._flush_ring(vad, ring)
         except Exception as exc:  # noqa: BLE001
             msg = f"Capture stream failed {self.tag}: {exc}"
             log.exception(msg)
-            print(f"[AUDIO CAPTURED] ERROR {msg}", flush=True)
-            self.capture_error.emit(msg)
-        finally:
-            print(f"[AUDIO CAPTURED] STOP tag={self.tag}", flush=True)
+            self._emit_error(msg)
 
 
 class AudioPipeline(QObject):
@@ -309,17 +386,16 @@ class AudioPipeline(QObject):
         self._dump_devices()
 
         mic = self._find_mic_device()
-        loopback = self._find_loopback_device()
-
-        # CRITICAL: never open WASAPI loopback with device=None — that can
-        # accidentally capture the microphone and duplicate every transcript.
-        if loopback is None:
-            msg = (
-                "No WASAPI loopback/output device resolved — interviewer capture DISABLED. "
-                "Play Zoom/Teams through speakers/headphones and retry Listen."
+        # Speaker / Stereo Mix index is diagnostic only — true loopback is opened
+        # inside the interviewer thread via open_wasapi_loopback() (PyAudioWPatch /
+        # soundcard / Stereo Mix). Never open Speakers (in=0) as InputStream.
+        loopback_hint = self._find_loopback_device()
+        if loopback_hint is None:
+            print(
+                "[AUDIO CAPTURED] no sounddevice speaker/stereo-mix hint — "
+                "interviewer thread will still try PyAudioWPatch/soundcard",
+                flush=True,
             )
-            print(f"[PIPELINE ERROR] {msg}", flush=True)
-            self.pipeline_error.emit(msg)
 
         # Candidate mic thread — NEVER loopback
         self._mic_thread = _CaptureWorker(
@@ -329,39 +405,42 @@ class AudioPipeline(QObject):
             config=self.config,
         )
         self._mic_thread.utterance_ready.connect(self._on_utterance)
-        self._mic_thread.capture_error.connect(self.pipeline_error.emit)
+        # Prefer error_occurred (GUI contract); capture_error kept for back-compat callers
+        self._mic_thread.error_occurred.connect(self.pipeline_error.emit)
         self._mic_thread.capture_status.connect(self.pipeline_status.emit)
+        self._mic_thread.finished.connect(self._on_worker_finished)
 
-        threads = [self._mic_thread]
+        # Interviewer WASAPI loopback — separate QThread; failures must not kill mic/GUI
+        self._loop_thread = _CaptureWorker(
+            tag="[INTERVIEWER]",
+            loopback=True,
+            device=loopback_hint,
+            config=self.config,
+        )
+        self._loop_thread.utterance_ready.connect(self._on_utterance)
+        self._loop_thread.error_occurred.connect(self.pipeline_error.emit)
+        self._loop_thread.capture_status.connect(self.pipeline_status.emit)
+        self._loop_thread.finished.connect(self._on_worker_finished)
 
-        if loopback is not None:
-            self._loop_thread = _CaptureWorker(
-                tag="[INTERVIEWER]",
-                loopback=True,
-                device=loopback,
-                config=self.config,
-            )
-            self._loop_thread.utterance_ready.connect(self._on_utterance)
-            self._loop_thread.capture_error.connect(self.pipeline_error.emit)
-            self._loop_thread.capture_status.connect(self.pipeline_status.emit)
-            threads.append(self._loop_thread)
-        else:
-            self._loop_thread = None
-
-        for t in threads:
-            t.start()
+        self._mic_thread.start()
+        self._loop_thread.start()
 
         self._running = True
-        status = (
-            "Listening — mic + WASAPI loopback isolated"
-            if loopback is not None
-            else "Listening — mic only (no loopback device)"
-        )
-        self.pipeline_status.emit(status)
+        self.pipeline_status.emit("Listening — mic + WASAPI loopback isolated")
         print(
-            f"[AUDIO CAPTURED] pipeline started mic={mic!r} loopback={loopback!r}",
+            f"[AUDIO CAPTURED] pipeline started mic={mic!r} loopback_hint={loopback_hint!r}",
             flush=True,
         )
+
+    def _on_worker_finished(self) -> None:
+        """Clear running if both capture threads have died (no orphan running=True)."""
+        mic_alive = self._mic_thread is not None and self._mic_thread.isRunning()
+        loop_alive = self._loop_thread is not None and self._loop_thread.isRunning()
+        if self._running and not mic_alive and not loop_alive:
+            self._running = False
+            msg = "Audio capture ended (both streams stopped)"
+            print(f"[AUDIO CAPTURED] {msg}", flush=True)
+            self.pipeline_status.emit(msg)
 
     def _dump_devices(self) -> None:
         try:
