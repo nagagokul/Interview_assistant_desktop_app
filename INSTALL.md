@@ -13,7 +13,7 @@ Designed for **Windows 10/11**, Intel i5-class CPUs, **8 GB RAM**. No Electron, 
    > needs those packages, but 3.11/3.12 is still the smoothest path.
 2. **API keys**
    - Groq: https://console.groq.com → create key for `whisper-large-v3`
-   - Google AI Studio: https://aistudio.google.com/apikey → key for `gemini-1.5-flash`
+   - Google AI Studio: https://aistudio.google.com/apikey → key for Gemini Flash (`gemini-flash-latest`)
 3. **Tesseract OCR** (for screen region text)
    - Installer: https://github.com/UB-Mannheim/tesseract/wiki  
    - Default path `C:\Program Files\Tesseract-OCR\` is auto-detected  
@@ -125,6 +125,7 @@ Full walkthrough with overlay map, hotkeys, interview workflow, modes, and check
 | No interviewer transcripts | Ensure call audio plays through speakers/headphones; grant mic privacy; try Stereo Mix / WASAPI |
 | `WasapiSettings ... unexpected keyword argument 'loopback'` | Fixed in current tree — pull latest. Then `pip install PyAudioWPatch soundcard` (Windows). sounddevice 0.5.x cannot take `loopback=True`. |
 | `Incompatible host API specific stream info` / `PaErrorCode -9984` | Mic opened with WASAPI-only `extra_settings` on an MME/DirectSound device. Pull latest — mic path now applies WasapiSettings only for WASAPI hosts and retries without extras. |
+| `models/gemini-1.5-flash is not found` / Gemini 404 | Gemini 1.5 was shut down. Pull latest (defaults to `gemini-flash-latest`) or set `GEMINI_MODEL=gemini-flash-latest` in `.env`. |
 | OCR empty | Install Tesseract; verify `tesseract --version` in cmd |
 | Overlay appears in screen share | Toggle **Stealth** off/on; requires Windows 10 2004+ |
 | **Overlay vanishes after Stealth ON** | Bug in older builds (Win32 layered alpha + capture exclusion). **Pull latest**, restart. Recovery now: tray icon → **Restore Overlay (if invisible)** or **Toggle Stealth**. Stealth keeps the window visible to you while hiding it from Zoom/Teams/Meet. |

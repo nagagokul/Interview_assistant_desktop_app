@@ -1,5 +1,5 @@
 """
-AIOrchestrator — rolling conversation memory + Gemini 1.5 Flash streaming.
+AIOrchestrator — rolling conversation memory + Gemini Flash streaming.
 
 - Thread-safe chronological transcript state tagged [INTERVIEWER]/[CANDIDATE]
 - Auto-triggers on interviewer turns (commands/questions — not only '?')
@@ -14,7 +14,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Deque, Generator
 
-from src.core.config import CONFIG
+from src.core.config import CONFIG, GEMINI_MODEL_FALLBACKS, normalize_gemini_model
 from src.core.context import CTX
 from src.core.event_bus import BUS, EventType
 from src.core.logging_setup import get_logger
@@ -200,6 +200,7 @@ class AIOrchestrator:
             from google import genai
 
             self._client = ("genai", genai.Client(api_key=api_key))
+            self.config.gemini_model = normalize_gemini_model(self.config.gemini_model)
             log.info("Using google-genai SDK model=%s", self.config.gemini_model)
             return self._client
         except Exception:  # noqa: BLE001
@@ -208,6 +209,7 @@ class AIOrchestrator:
         import google.generativeai as genai_legacy
 
         genai_legacy.configure(api_key=api_key)
+        self.config.gemini_model = normalize_gemini_model(self.config.gemini_model)
         model = genai_legacy.GenerativeModel(
             model_name=self.config.gemini_model,
             system_instruction=_load_system_prompt(),
@@ -412,20 +414,44 @@ class AIOrchestrator:
             temperature=self.config.temperature,
             max_output_tokens=self.config.max_output_tokens,
         )
-        try:
-            response = client.models.generate_content_stream(
-                model=self.config.gemini_model,
-                contents=contents,
-                config=config,
-            )
-            for chunk in response:
-                if self._cancel.is_set():
-                    break
-                text = getattr(chunk, "text", None)
-                if text:
-                    yield text
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"generate_content_stream failed: {exc}") from exc
+
+        primary = normalize_gemini_model(self.config.gemini_model)
+        candidates: list[str] = []
+        for name in (primary, *GEMINI_MODEL_FALLBACKS):
+            n = normalize_gemini_model(name)
+            if n not in candidates:
+                candidates.append(n)
+
+        last_exc: Exception | None = None
+        for model_name in candidates:
+            try:
+                print(f"[GEMINI STREAM START] model={model_name}", flush=True)
+                response = client.models.generate_content_stream(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                # Commit working model so later turns skip dead ids
+                if model_name != self.config.gemini_model:
+                    log.info("Gemini model fallback engaged: %s → %s", self.config.gemini_model, model_name)
+                    self.config.gemini_model = model_name
+                for chunk in response:
+                    if self._cancel.is_set():
+                        break
+                    text = getattr(chunk, "text", None)
+                    if text:
+                        yield text
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc)
+                not_found = "404" in msg or "NOT_FOUND" in msg or "not found" in msg.lower()
+                print(f"[GEMINI STREAM START] model={model_name} failed: {exc}", flush=True)
+                if not_found:
+                    continue
+                raise RuntimeError(f"generate_content_stream failed: {exc}") from exc
+
+        raise RuntimeError(f"generate_content_stream failed: {last_exc}") from last_exc
 
     def _stream_legacy(
         self, model: Any, prompt: str, image_jpeg: bytes | None
@@ -436,26 +462,56 @@ class AIOrchestrator:
             import io
 
             content.insert(0, Image.open(io.BytesIO(image_jpeg)))
-        try:
-            stream = model.generate_content(
-                content,
-                stream=True,
-                generation_config={
-                    "temperature": self.config.temperature,
-                    "max_output_tokens": self.config.max_output_tokens,
-                },
-            )
-            for chunk in stream:
-                if self._cancel.is_set():
-                    break
-                try:
-                    text = chunk.text
-                except Exception:  # noqa: BLE001
-                    text = ""
-                if text:
-                    yield text
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"legacy generate_content failed: {exc}") from exc
+
+        # Legacy path: recreate GenerativeModel with fallbacks on 404
+        import google.generativeai as genai_legacy
+
+        primary = normalize_gemini_model(self.config.gemini_model)
+        candidates: list[str] = []
+        for name in (primary, *GEMINI_MODEL_FALLBACKS):
+            n = normalize_gemini_model(name)
+            if n not in candidates:
+                candidates.append(n)
+
+        last_exc: Exception | None = None
+        for model_name in candidates:
+            try:
+                active = model
+                if normalize_gemini_model(getattr(model, "model_name", "") or "") != model_name:
+                    active = genai_legacy.GenerativeModel(
+                        model_name=model_name,
+                        system_instruction=_load_system_prompt(),
+                    )
+                stream = active.generate_content(
+                    content,
+                    stream=True,
+                    generation_config={
+                        "temperature": self.config.temperature,
+                        "max_output_tokens": self.config.max_output_tokens,
+                    },
+                )
+                if model_name != self.config.gemini_model:
+                    self.config.gemini_model = model_name
+                    self._client = ("legacy", active)
+                for chunk in stream:
+                    if self._cancel.is_set():
+                        break
+                    try:
+                        text = chunk.text
+                    except Exception:  # noqa: BLE001
+                        text = ""
+                    if text:
+                        yield text
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc)
+                not_found = "404" in msg or "NOT_FOUND" in msg or "not found" in msg.lower()
+                if not_found:
+                    continue
+                raise RuntimeError(f"legacy generate_content failed: {exc}") from exc
+
+        raise RuntimeError(f"legacy generate_content failed: {last_exc}") from last_exc
 
     def ask_sync(self, user_hint: str = "", mode: str = "auto") -> str:
         prompt, image = self.build_prompt(user_hint, True, mode)

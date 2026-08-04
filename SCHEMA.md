@@ -98,7 +98,7 @@ Non-secret UI/runtime preferences only — **API keys never written here**.
 {
   "audio": { "sample_rate": 16000, "vad_aggressiveness": 2 },
   "ocr": { "poll_interval_ms": 80, "change_threshold": 0.018 },
-  "ai": { "gemini_model": "gemini-1.5-flash", "stream": true },
+  "ai": { "gemini_model": "gemini-flash-latest", "stream": true },
   "rag": { "top_k": 4, "chunk_size": 800 },
   "ui": { "opacity": 0.92, "stealth_enabled": true, "hotkey_toggle": "alt+h" },
   "log_level": "INFO"
