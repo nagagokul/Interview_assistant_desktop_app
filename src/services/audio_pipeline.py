@@ -244,6 +244,8 @@ class _CaptureWorker(QThread):
             self._emit_error(f"sounddevice unavailable for {self.tag}: {exc}")
             return
 
+        from src.utils.audio_devices import device_hostapi_name, wasapi_extra_settings_for_device
+
         vad = VoiceActivityDetector(
             sample_rate=cfg.sample_rate,
             frame_ms=cfg.chunk_ms,
@@ -252,6 +254,12 @@ class _CaptureWorker(QThread):
         )
         ring = RingPCMBuffer(cfg.max_utterance_ms, cfg.sample_rate)
         blocksize = int(cfg.sample_rate * cfg.chunk_ms / 1000)
+        host = device_hostapi_name(self.device, sd)
+        print(
+            f"[AUDIO CAPTURED] mic open device={self.device!r} host={host!r} "
+            f"sr={cfg.sample_rate} ch=1",
+            flush=True,
+        )
         self.capture_status.emit(f"{self.tag} capturing ({role})")
 
         def _callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:  # noqa: ARG001
@@ -263,34 +271,83 @@ class _CaptureWorker(QThread):
             mono = indata[:, 0] if indata.ndim > 1 else indata
             self._process_mono_chunk(mono, vad=vad, ring=ring, role=role, cfg=cfg)
 
-        # Shared-mode WASAPI only — never pass loopback= into WasapiSettings
-        extra = None
-        if hasattr(sd, "WasapiSettings"):
-            try:
-                extra = sd.WasapiSettings(exclusive=False, auto_convert=True)
-            except TypeError:
-                try:
-                    extra = sd.WasapiSettings(exclusive=False)
-                except Exception:  # noqa: BLE001
-                    extra = None
+        # CRITICAL: WasapiSettings is host-API-specific. Attaching it to an MME /
+        # DirectSound mic raises PaErrorCode -9984 (Incompatible host API specific
+        # stream info). Only pass it when the resolved device is actually WASAPI.
+        extra = wasapi_extra_settings_for_device(self.device, sd)
+        print(
+            f"[AUDIO CAPTURED] mic extra_settings="
+            f"{'WasapiSettings(shared)' if extra is not None else 'None'}",
+            flush=True,
+        )
 
-        try:
-            with sd.InputStream(
-                samplerate=cfg.sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=blocksize,
-                device=self.device,
-                callback=_callback,
-                extra_settings=extra,
-            ):
-                while not self._stop.is_set():
-                    self._stop.wait(0.15)
-            self._flush_ring(vad, ring)
-        except Exception as exc:  # noqa: BLE001
-            msg = f"Capture stream failed {self.tag}: {exc}"
-            log.exception(msg)
-            self._emit_error(msg)
+        open_attempts: list[tuple[str, dict[str, Any]]] = [
+            (
+                "primary",
+                {
+                    "samplerate": cfg.sample_rate,
+                    "channels": 1,
+                    "dtype": "float32",
+                    "blocksize": blocksize,
+                    "device": self.device,
+                    "callback": _callback,
+                    "extra_settings": extra,
+                },
+            ),
+        ]
+        # Always have a bare fallback (no host-API extras) for -9984 / similar
+        if extra is not None:
+            open_attempts.append(
+                (
+                    "no-wasapi-extra",
+                    {
+                        "samplerate": cfg.sample_rate,
+                        "channels": 1,
+                        "dtype": "float32",
+                        "blocksize": blocksize,
+                        "device": self.device,
+                        "callback": _callback,
+                        "extra_settings": None,
+                    },
+                )
+            )
+        # Last resort: system default input, no extras
+        if self.device is not None:
+            open_attempts.append(
+                (
+                    "system-default-mic",
+                    {
+                        "samplerate": cfg.sample_rate,
+                        "channels": 1,
+                        "dtype": "float32",
+                        "blocksize": blocksize,
+                        "device": None,
+                        "callback": _callback,
+                        "extra_settings": None,
+                    },
+                )
+            )
+
+        last_exc: Exception | None = None
+        for label, kwargs in open_attempts:
+            try:
+                print(f"[AUDIO CAPTURED] mic InputStream attempt={label}", flush=True)
+                with sd.InputStream(**kwargs):
+                    while not self._stop.is_set():
+                        self._stop.wait(0.15)
+                self._flush_ring(vad, ring)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                print(
+                    f"[AUDIO CAPTURED] mic attempt={label} failed: {exc}",
+                    flush=True,
+                )
+                continue
+
+        msg = f"Capture stream failed {self.tag}: {last_exc}"
+        log.exception(msg)
+        self._emit_error(msg)
 
 
 class AudioPipeline(QObject):

@@ -124,6 +124,7 @@ Full walkthrough with overlay map, hotkeys, interview workflow, modes, and check
 | “Missing API keys” dialog | Place `.env` beside EXE or in `%APPDATA%\Copilot\.env` |
 | No interviewer transcripts | Ensure call audio plays through speakers/headphones; grant mic privacy; try Stereo Mix / WASAPI |
 | `WasapiSettings ... unexpected keyword argument 'loopback'` | Fixed in current tree — pull latest. Then `pip install PyAudioWPatch soundcard` (Windows). sounddevice 0.5.x cannot take `loopback=True`. |
+| `Incompatible host API specific stream info` / `PaErrorCode -9984` | Mic opened with WASAPI-only `extra_settings` on an MME/DirectSound device. Pull latest — mic path now applies WasapiSettings only for WASAPI hosts and retries without extras. |
 | OCR empty | Install Tesseract; verify `tesseract --version` in cmd |
 | Overlay appears in screen share | Toggle **Stealth** off/on; requires Windows 10 2004+ |
 | **Overlay vanishes after Stealth ON** | Bug in older builds (Win32 layered alpha + capture exclusion). **Pull latest**, restart. Recovery now: tray icon → **Restore Overlay (if invisible)** or **Toggle Stealth**. Stealth keeps the window visible to you while hiding it from Zoom/Teams/Meet. |

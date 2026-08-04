@@ -180,6 +180,39 @@ def test_split_default_device_input_output_pair() -> None:
     assert resolve_loopback_device(9) == 9
 
 
+def test_wasapi_extra_settings_only_for_wasapi_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: PaErrorCode -9984 when WasapiSettings hit an MME/DS mic."""
+    from src.utils import audio_devices as ad
+
+    class _FakeSD:
+        class WasapiSettings:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        def __init__(self, host: str):
+            self._host = host
+
+        def query_devices(self, device=None):
+            return {"hostapi": 0, "name": "Mic", "max_input_channels": 1}
+
+        def query_hostapis(self, idx):
+            return {"name": self._host}
+
+        @property
+        def default(self):
+            class D:
+                device = 0
+
+            return D()
+
+    assert ad.is_wasapi_device(0, _FakeSD("Windows WASAPI")) is True
+    assert ad.is_wasapi_device(0, _FakeSD("MME")) is False
+    assert ad.wasapi_extra_settings_for_device(0, _FakeSD("MME")) is None
+    extra = ad.wasapi_extra_settings_for_device(0, _FakeSD("Windows WASAPI"))
+    assert extra is not None
+    assert getattr(extra, "kwargs", {}).get("exclusive") is False
+
+
 def test_no_wasapi_settings_loopback_kwarg_in_source() -> None:
     """Regression: sounddevice 0.5.x crashes on WasapiSettings(loopback=True)."""
     import re
