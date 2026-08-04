@@ -87,8 +87,10 @@ class AudioCaptureService:
 
     def _on_error(self, message: str) -> None:
         log.error(message)
+        print(f"[PIPELINE ERROR] {message}", flush=True)
         if self.hub is not None:
-            self.hub.ai_error.emit(message)
+            # Do NOT send to ai_error (that paints the AI guidance panel).
+            # Status + UI log strip via status signal is enough.
             self.hub.emit_status(message)
 
     def _on_status(self, message: str) -> None:

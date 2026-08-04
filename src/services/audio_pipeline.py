@@ -23,6 +23,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from src.core.config import CONFIG, AudioConfig
 from src.core.logging_setup import get_logger
+from src.utils.audio_devices import resolve_loopback_device, resolve_mic_device
 from src.utils.text_similarity import text_similarity
 from src.utils.vad import RingPCMBuffer, VoiceActivityDetector, pcm16_to_wav
 
@@ -252,42 +253,26 @@ class AudioPipeline(QObject):
     # ---- device discovery ----
 
     def _find_mic_device(self) -> int | None:
-        if self.config.mic_device_index is not None:
-            return self.config.mic_device_index
+        """Return mic index, or None to use sounddevice's default input."""
         try:
-            import sounddevice as sd
-
-            default = sd.default.device
-            if isinstance(default, (list, tuple)):
-                return int(default[0])
-            return int(default)
+            idx = resolve_mic_device(self.config.mic_device_index)
+            print(f"[AUDIO CAPTURED] mic device resolved → {idx!r}", flush=True)
+            return idx
         except Exception as exc:  # noqa: BLE001
-            self.pipeline_error.emit(f"Mic discovery failed: {exc}")
+            msg = f"Mic discovery failed: {exc} — falling back to system default"
+            print(f"[PIPELINE ERROR] {msg}", flush=True)
+            self.pipeline_error.emit(msg)
             return None
 
     def _find_loopback_device(self) -> int | None:
-        if self.config.loopback_device_index is not None:
-            return self.config.loopback_device_index
         try:
-            import sounddevice as sd
-
-            # Prefer explicit loopback/stereo-mix names on WASAPI
-            for i, d in enumerate(sd.query_devices()):
-                name = str(d["name"]).lower()
-                host = sd.query_hostapis(d["hostapi"])["name"].lower()
-                if "wasapi" in host and d["max_input_channels"] > 0:
-                    if "loopback" in name or "stereo mix" in name or "what u hear" in name:
-                        print(f"[AUDIO CAPTURED] loopback device by name idx={i} name={d['name']}", flush=True)
-                        return i
-            # Use default OUTPUT index with WasapiSettings(loopback=True)
-            default = sd.default.device
-            if isinstance(default, (list, tuple)) and len(default) >= 2:
-                idx = int(default[1])
-                print(f"[AUDIO CAPTURED] loopback via default output idx={idx}", flush=True)
-                return idx
-            return None
+            idx = resolve_loopback_device(self.config.loopback_device_index)
+            print(f"[AUDIO CAPTURED] loopback device resolved → {idx!r}", flush=True)
+            return idx
         except Exception as exc:  # noqa: BLE001
-            self.pipeline_error.emit(f"Loopback discovery failed: {exc}")
+            msg = f"Loopback discovery failed: {exc}"
+            print(f"[PIPELINE ERROR] {msg}", flush=True)
+            self.pipeline_error.emit(msg)
             return None
 
     def list_devices(self) -> list[dict[str, Any]]:
@@ -322,12 +307,11 @@ class AudioPipeline(QObject):
 
         mic = self._find_mic_device()
         loopback = self._find_loopback_device()
-        if mic is None:
-            self.pipeline_error.emit("No microphone device found")
-            return
+
+        # mic=None is valid — sounddevice uses the OS default input device
         if loopback is None:
             self.pipeline_error.emit(
-                "No WASAPI loopback device found — interviewer capture disabled. "
+                "No WASAPI loopback device found — interviewer capture may be unavailable. "
                 "Play call audio through speakers/headphones."
             )
 
@@ -335,7 +319,7 @@ class AudioPipeline(QObject):
         self._mic_thread = _CaptureWorker(
             tag="[CANDIDATE]",
             loopback=False,
-            device=mic,
+            device=mic,  # None ⇒ system default mic
             config=self.config,
         )
         self._mic_thread.utterance_ready.connect(self._on_utterance)
@@ -355,6 +339,8 @@ class AudioPipeline(QObject):
             self._loop_thread.capture_error.connect(self.pipeline_error.emit)
             self._loop_thread.capture_status.connect(self.pipeline_status.emit)
             threads.append(self._loop_thread)
+        else:
+            self._loop_thread = None
 
         for t in threads:
             t.start()
@@ -362,7 +348,7 @@ class AudioPipeline(QObject):
         self._running = True
         self.pipeline_status.emit("Listening — mic + WASAPI loopback isolated")
         print(
-            f"[AUDIO CAPTURED] pipeline started mic={mic} loopback={loopback}",
+            f"[AUDIO CAPTURED] pipeline started mic={mic!r} loopback={loopback!r}",
             flush=True,
         )
 

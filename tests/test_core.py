@@ -162,3 +162,19 @@ def test_conversation_memory_last_n() -> None:
     assert "[CANDIDATE]" in block
     assert "quicksort" in block
     assert "C++" in block
+
+
+def test_split_default_device_input_output_pair() -> None:
+    from src.utils.audio_devices import resolve_mic_device, resolve_loopback_device, split_default_device
+
+    class _Pair:
+        def __init__(self, inn, out):
+            self.input = inn
+            self.output = out
+
+    assert split_default_device(_Pair(3, 7)) == (3, 7)
+    assert split_default_device((1, 2)) == (1, 2)
+    assert split_default_device(5) == (5, 5)
+    # Without sounddevice, resolvers still return None safely
+    assert resolve_mic_device(4) == 4
+    assert resolve_loopback_device(9) == 9
