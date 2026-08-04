@@ -117,3 +117,49 @@ def resolve_loopback_device(explicit: int | None = None) -> int | None:
     except Exception:
         pass
     return None
+
+
+def device_hostapi_name(device: int | None, sd: Any | None = None) -> str:
+    """Return host API name for a sounddevice device index ('' if unknown)."""
+    try:
+        if sd is None:
+            import sounddevice as sd  # type: ignore
+        if device is None:
+            inn, _ = split_default_device(sd.default.device)
+            device = inn
+        if device is None:
+            return ""
+        info = sd.query_devices(device)
+        return str(sd.query_hostapis(info["hostapi"])["name"])
+    except Exception:
+        return ""
+
+
+def is_wasapi_device(device: int | None, sd: Any | None = None) -> bool:
+    return "wasapi" in device_hostapi_name(device, sd).lower()
+
+
+def wasapi_extra_settings_for_device(device: int | None, sd: Any) -> Any | None:
+    """
+    Return WasapiSettings ONLY when the target device is on Windows WASAPI.
+
+    Passing WasapiSettings to MME/DirectSound/WDM-KS devices yields:
+      PaErrorCode -9984 (paIncompatibleHostApiSpecificStreamInfo)
+    """
+    if not is_wasapi_device(device, sd):
+        return None
+    WasapiSettings = getattr(sd, "WasapiSettings", None)
+    if WasapiSettings is None:
+        return None
+    for kwargs in (
+        {"exclusive": False, "auto_convert": True},
+        {"exclusive": False},
+        {},
+    ):
+        try:
+            return WasapiSettings(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return None
+    return None
