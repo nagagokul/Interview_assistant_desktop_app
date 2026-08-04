@@ -70,6 +70,7 @@ class OverlayDashboard(QWidget):
         # not only '?'). Do NOT also fire ask_ai here — that caused races.
 
         self._build_ui()
+        self.ai.set_mode_provider(lambda: self.mode.currentText())
         self.setStyleSheet(STYLESHEET)
         self.setWindowTitle("Interview Copilot")
         self.resize(max(CONFIG.ui.width, 480), max(CONFIG.ui.height, 720))
