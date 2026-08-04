@@ -126,3 +126,13 @@ def test_prompt_builder_includes_transcript(monkeypatch: pytest.MonkeyPatch) -> 
     assert "binary search" in prompt.lower()
     assert "binary_search" in prompt
     assert image is None
+
+
+def test_markdown_to_html_code_fence() -> None:
+    from src.utils.markdown_html import markdown_to_html
+
+    html = markdown_to_html("## Answer\n\n```python\nprint(1)\n```\n\n**Done**")
+    assert "<h3" in html
+    assert "<pre" in html
+    assert "print(1)" in html
+    assert "<b>Done</b>" in html

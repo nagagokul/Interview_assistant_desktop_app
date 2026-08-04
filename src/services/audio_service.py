@@ -2,19 +2,19 @@
 AudioCaptureService — dual-stream diarization capture.
 
 - Interviewer: WASAPI loopback (system speakers / headphones)
-- Candidate: microphone via PyAudio / sounddevice
+- Candidate: microphone via sounddevice
 
-Chunks are VAD-segmented and transcribed via Groq whisper-large-v3.
+Chunks are VAD-segmented, transcribed via Groq whisper-large-v3, then routed
+through StreamHub pyqtSignals onto the GUI thread (no dropouts).
 """
 
 from __future__ import annotations
 
-import asyncio
 import io
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
@@ -23,6 +23,9 @@ from src.core.context import CTX
 from src.core.event_bus import BUS, EventType
 from src.core.logging_setup import get_logger
 from src.utils.vad import RingPCMBuffer, VoiceActivityDetector, pcm16_to_wav
+
+if TYPE_CHECKING:
+    from src.core.stream_hub import StreamHub
 
 log = get_logger("audio")
 
@@ -85,16 +88,14 @@ class _StreamWorker(threading.Thread):
         self.config = config
         self.on_utterance = on_utterance
         self.stop_event = stop_event
-        self._sd = None
 
     def run(self) -> None:
         try:
             import sounddevice as sd
-
-            self._sd = sd
         except Exception:  # noqa: BLE001
             log.exception("[%s] sounddevice not available", self.speaker)
             BUS.publish(EventType.STATUS, message=f"Audio backend missing ({self.speaker})")
+            print(f"[AUDIO CAPTURED] ERROR sounddevice missing speaker={self.speaker}", flush=True)
             return
 
         cfg = self.config
@@ -106,13 +107,18 @@ class _StreamWorker(threading.Thread):
         )
         ring = RingPCMBuffer(cfg.max_utterance_ms, cfg.sample_rate)
         blocksize = int(cfg.sample_rate * cfg.chunk_ms / 1000)
+        source = "WASAPI_LOOPBACK" if self.loopback else "MICROPHONE"
+        print(
+            f"[AUDIO CAPTURED] opening source={source} speaker={self.speaker} "
+            f"device={self.device} sr={cfg.sample_rate}",
+            flush=True,
+        )
 
         def _callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:  # noqa: ARG001
             if status:
                 log.debug("[%s] stream status: %s", self.speaker, status)
             if self.stop_event.is_set():
                 raise sd.CallbackStop()
-            # Convert float32 [-1,1] -> PCM16
             clipped = np.clip(indata[:, 0], -1.0, 1.0)
             pcm = (clipped * 32767.0).astype(np.int16).tobytes()
             if cfg.noise_suppress:
@@ -126,24 +132,21 @@ class _StreamWorker(threading.Thread):
                 min_bytes = int(cfg.sample_rate * (cfg.min_utterance_ms / 1000.0) * 2)
                 vad.reset()
                 if len(blob) >= min_bytes:
+                    print(
+                        f"[AUDIO CAPTURED] utterance source={source} speaker={self.speaker} "
+                        f"bytes={len(blob)}",
+                        flush=True,
+                    )
                     self.on_utterance(self.speaker, blob)
 
         extra = None
         try:
-            # WASAPI loopback on Windows
             if self.loopback and hasattr(sd, "WasapiSettings"):
                 extra = sd.WasapiSettings(loopback=True)
         except Exception:  # noqa: BLE001
             extra = None
 
         try:
-            log.info(
-                "[%s] opening stream device=%s loopback=%s sr=%s",
-                self.speaker,
-                self.device,
-                self.loopback,
-                cfg.sample_rate,
-            )
             with sd.InputStream(
                 samplerate=cfg.sample_rate,
                 channels=1,
@@ -155,13 +158,18 @@ class _StreamWorker(threading.Thread):
             ):
                 while not self.stop_event.is_set():
                     self.stop_event.wait(0.2)
-                    # Flush hanging utterance on stop
             if vad.in_utterance and len(ring) > 0:
                 blob = ring.dump()
                 if blob:
+                    print(
+                        f"[AUDIO CAPTURED] final flush source={source} speaker={self.speaker} "
+                        f"bytes={len(blob)}",
+                        flush=True,
+                    )
                     self.on_utterance(self.speaker, blob)
         except Exception:  # noqa: BLE001
             log.exception("[%s] capture stream failed", self.speaker)
+            print(f"[AUDIO CAPTURED] ERROR stream failed speaker={self.speaker}", flush=True)
             BUS.publish(
                 EventType.STATUS,
                 message=f"Audio capture error ({self.speaker}) — check device permissions",
@@ -169,7 +177,6 @@ class _StreamWorker(threading.Thread):
 
     @staticmethod
     def _soft_noise_gate(pcm: bytes, threshold: int = 180) -> bytes:
-        """Simple soft gate — zeros near-silent frames to cut fan noise."""
         arr = np.frombuffer(pcm, dtype=np.int16).copy()
         if arr.size == 0:
             return pcm
@@ -182,17 +189,22 @@ class _StreamWorker(threading.Thread):
 class AudioCaptureService:
     """
     Orchestrates parallel interviewer (loopback) + candidate (mic) capture
-    and async Groq transcription with automatic punctuation (Whisper default).
+    and Groq transcription, emitting interviewer_text / candidate_text signals.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hub: StreamHub | None = None) -> None:
         self.config = CONFIG.audio
+        self.hub = hub
         self.transcriber = GroqTranscriber(CONFIG.groq_api_key, CONFIG.ai.groq_model)
         self._stop = threading.Event()
         self._workers: list[_StreamWorker] = []
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="whisper")
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
+        # Rolling global context string for Gemini
+        self.rolling_context: str = ""
+
+    def set_hub(self, hub: StreamHub) -> None:
+        self.hub = hub
 
     @property
     def running(self) -> bool:
@@ -226,17 +238,15 @@ class AudioCaptureService:
         try:
             import sounddevice as sd
 
-            # Prefer default output mapped as WASAPI loopback input
             for i, d in enumerate(sd.query_devices()):
                 name = str(d["name"]).lower()
                 host = sd.query_hostapis(d["hostapi"])["name"].lower()
                 if "wasapi" in host and d["max_input_channels"] > 0:
                     if "loopback" in name or "stereo mix" in name or "what u hear" in name:
                         return i
-            # Fallback: default output device index (WasapiSettings.loopback=True)
             default = sd.default.device
             if isinstance(default, (list, tuple)) and len(default) >= 2:
-                return int(default[1])  # output device for loopback
+                return int(default[1])
             return None
         except Exception:  # noqa: BLE001
             log.exception("Loopback device discovery failed")
@@ -259,8 +269,12 @@ class AudioCaptureService:
         if self._running:
             return
         if not CONFIG.groq_api_key:
-            BUS.publish(EventType.STATUS, message="Set GROQ_API_KEY in .env to enable transcription")
+            msg = "Set GROQ_API_KEY in .env to enable transcription"
+            BUS.publish(EventType.STATUS, message=msg)
+            if self.hub:
+                self.hub.emit_status(msg)
             log.error("Cannot start audio — missing GROQ_API_KEY")
+            print("[AUDIO CAPTURED] ERROR missing GROQ_API_KEY", flush=True)
             return
 
         self._stop.clear()
@@ -294,6 +308,9 @@ class AudioCaptureService:
         CTX.is_listening = True
         CTX.set_status("Listening (mic + system audio)")
         BUS.publish(EventType.STATUS, message="Audio capture started")
+        if self.hub:
+            self.hub.emit_status("Listening (mic + system audio)")
+        print(f"[AUDIO CAPTURED] service started mic={mic} loopback={loopback}", flush=True)
         log.info("AudioCaptureService started mic=%s loopback=%s", mic, loopback)
 
     def stop(self) -> None:
@@ -305,24 +322,44 @@ class AudioCaptureService:
         CTX.is_listening = False
         CTX.set_status("Audio stopped")
         BUS.publish(EventType.STATUS, message="Audio capture stopped")
+        if self.hub:
+            self.hub.emit_status("Audio stopped")
+        print("[AUDIO CAPTURED] service stopped", flush=True)
         log.info("AudioCaptureService stopped")
 
     def _on_utterance(self, speaker: str, pcm: bytes) -> None:
         self._pool.submit(self._transcribe_job, speaker, pcm)
 
     def _transcribe_job(self, speaker: str, pcm: bytes) -> None:
+        source = "WASAPI_LOOPBACK" if speaker == "interviewer" else "MICROPHONE"
         try:
             wav = pcm16_to_wav(pcm, self.config.sample_rate, 1)
             text = self.transcriber.transcribe(wav)
             if not text:
+                print(f"[GROQ TRANSCRIPT RECEIVED] source={source} EMPTY", flush=True)
                 return
-            CTX.add_transcript(speaker, text)
-            BUS.publish(
-                EventType.TRANSCRIPT,
-                speaker=speaker,
-                text=text,
+
+            print(
+                f"[GROQ TRANSCRIPT RECEIVED] source={source} speaker={speaker} text={text[:160]!r}",
+                flush=True,
             )
-            log.debug("Transcript [%s]: %s", speaker, text[:120])
+
+            CTX.add_transcript(speaker, text)
+            line = f"[{speaker}] {text}"
+            self.rolling_context = (self.rolling_context + "\n" + line).strip()
+            # Keep rolling context bounded
+            if len(self.rolling_context) > 12_000:
+                self.rolling_context = self.rolling_context[-10_000:]
+
+            # Primary path: thread-safe Qt signals
+            if self.hub is not None:
+                self.hub.emit_transcript(speaker, text)
+            # Secondary path: EventBus (legacy / non-UI consumers)
+            BUS.publish(EventType.TRANSCRIPT, speaker=speaker, text=text)
+            log.info("Transcript [%s/%s]: %s", source, speaker, text[:120])
         except Exception as exc:  # noqa: BLE001
             log.exception("Transcription failed")
+            print(f"[GROQ TRANSCRIPT RECEIVED] ERROR source={source} err={exc}", flush=True)
             BUS.publish(EventType.AI_ERROR, message=f"Transcription error: {exc}")
+            if self.hub:
+                self.hub.ai_error.emit(f"Transcription error: {exc}")

@@ -45,8 +45,12 @@ Full setup: **[INSTALL.md](INSTALL.md)** · **How to use: [USAGE.md](USAGE.md)**
 2. Turn **Stealth** ON and drop your **resume** onto the overlay.
 3. Press `Alt+S`, drag a box over the coding pad / problem, then click **OCR Watch**.
 4. Click **Listen** so interviewer (speakers) and you (mic) are transcribed.
-5. Press `Alt+Enter` (or **Ask**) for a context-aware answer in the **Assistant** tab.
-6. Press `Alt+H` anytime to hide/show the overlay.
+5. Watch the **top panel** fill with blue (Interviewer) / grey (You) bubbles.
+6. Press `Alt+Enter` (or **Ask**) — answers stream in the **bottom AI panel**.
+7. Press `Alt+H` anytime to hide/show the overlay.
+
+In the terminal you should see verification logs like:
+`[AUDIO CAPTURED]` → `[GROQ TRANSCRIPT RECEIVED]` → `[UI TEXT APPENDED]` → `[GEMINI STREAM START]`.
 
 Step-by-step walkthrough, modes, and checklist: **[USAGE.md](USAGE.md)**
 
