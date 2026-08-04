@@ -140,7 +140,11 @@ def test_markdown_to_html_code_fence() -> None:
 
 def test_echo_similarity_and_interviewer_prompt() -> None:
     from src.utils.text_similarity import text_similarity
-    from src.services.ai_orchestrator import looks_like_interviewer_prompt
+    from src.services.ai_orchestrator import (
+        looks_like_chitchat,
+        looks_like_interviewer_prompt,
+        looks_like_technical_prompt,
+    )
 
     a = "write a code in C++ and insert a node in Linux"
     b = "write a code in C++ and insert a node in Linux."
@@ -148,6 +152,39 @@ def test_echo_similarity_and_interviewer_prompt() -> None:
     assert looks_like_interviewer_prompt(a) is True
     assert looks_like_interviewer_prompt("ok") is False
     assert looks_like_interviewer_prompt("What is a mutex?") is True
+    assert looks_like_chitchat("Hello, are you there?") is True
+    assert looks_like_chitchat("Hey, I'm audible, no?") is True
+    assert looks_like_interviewer_prompt("Hello, are you there?") is False
+    assert looks_like_technical_prompt(
+        "So can you write the code in C++ to insert the node in linked list?"
+    )
+    assert looks_like_interviewer_prompt(
+        "So can you write the code in C++ to insert the node in linked list?"
+    )
+
+
+def test_auto_ask_does_not_skip_when_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: coding Q arrived while Gemini still answering audio-check."""
+    from src.services.ai_orchestrator import AIOrchestrator
+    from src.core import context as ctx_mod
+
+    orch = AIOrchestrator(hub=None)
+    calls: list[dict] = []
+
+    def _fake_ask(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(orch, "ask", _fake_ask)
+    monkeypatch.setattr(ctx_mod.CTX, "is_ai_streaming", True)
+
+    orch._schedule_auto_ask("write C++ code to insert a node in a linked list")
+    assert orch._debounce_timer is not None
+    orch._debounce_timer.cancel()
+    # Fire immediately
+    orch._debounce_timer.function()
+    assert len(calls) == 1
+    assert "linked list" in calls[0]["user_hint"]
+    assert calls[0]["mode"] in ("auto", "coding")
 
 
 def test_conversation_memory_last_n() -> None:

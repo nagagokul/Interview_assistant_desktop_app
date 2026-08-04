@@ -95,10 +95,87 @@ class ConversationMemory:
             self._turns.clear()
 
 
+def looks_like_technical_prompt(text: str) -> bool:
+    lower = (text or "").lower()
+    tech = (
+        "write ",
+        "implement",
+        "code",
+        "c++",
+        "python",
+        "java",
+        "leetcode",
+        "algorithm",
+        "linked list",
+        "binary tree",
+        "complexity",
+        "insert ",
+        "design ",
+        "sql",
+        "class ",
+        "function",
+        "recurse",
+        "pointer",
+        "array",
+        "stack",
+        "queue",
+        "graph",
+        "sort",
+        "debug",
+        "optimize",
+        "api",
+        "database",
+        "system design",
+    )
+    return any(k in lower for k in tech)
+
+
+def looks_like_chitchat(text: str) -> bool:
+    """Audio checks / greetings that should NOT burn a Gemini turn."""
+    t = " ".join((text or "").strip().lower().split())
+    if not t:
+        return True
+    # Short greetings / mic checks
+    if len(t) < 48 and any(
+        p in t
+        for p in (
+            "hello",
+            "hi there",
+            "hey there",
+            "good morning",
+            "good afternoon",
+            "can you hear",
+            "could you hear",
+            "are you there",
+            "you there",
+            "am i audible",
+            "i'm audible",
+            "im audible",
+            "are you audible",
+            "audible to you",
+            "hear me",
+            "hearing me",
+            "testing 1",
+            "test test",
+            "check check",
+            "mic check",
+            "is this working",
+            "you got me",
+        )
+    ):
+        # Still allow if it also looks like a real technical ask
+        if looks_like_technical_prompt(t):
+            return False
+        return True
+    return False
+
+
 def looks_like_interviewer_prompt(text: str) -> bool:
     """True when an interviewer utterance should trigger Gemini (not only '?')."""
     t = (text or "").strip()
     if len(t) < 8:
+        return False
+    if looks_like_chitchat(t):
         return False
     lower = t.lower()
     # Explicit question
@@ -137,7 +214,6 @@ def looks_like_interviewer_prompt(text: str) -> bool:
 class AIOrchestrator:
     """Gemini streaming orchestrator with conversation memory + auto trigger."""
 
-    # Signals mirrored onto hub; also exposed for direct Qt wiring
     def __init__(self, hub: StreamHub | None = None) -> None:
         self.config = CONFIG.ai
         self.hub = hub
@@ -149,6 +225,9 @@ class AIOrchestrator:
         self._auto_enabled = True
         self._debounce_timer: threading.Timer | None = None
         self._on_error: Callable[[str], None] | None = None
+        self._mode_provider: Callable[[], str] | None = None
+        self._generation = 0  # monotonic; stale streams must not update UI
+        self._pending_auto_text: str = ""
 
     def set_hub(self, hub: StreamHub) -> None:
         self.hub = hub
@@ -156,37 +235,70 @@ class AIOrchestrator:
     def set_error_handler(self, cb: Callable[[str], None]) -> None:
         self._on_error = cb
 
+    def set_mode_provider(self, cb: Callable[[], str]) -> None:
+        """UI supplies current Ask-mode combo (coding / auto / …)."""
+        self._mode_provider = cb
+
+    def _current_mode(self) -> str:
+        if self._mode_provider is not None:
+            try:
+                mode = (self._mode_provider() or "auto").strip()
+                if mode:
+                    return mode
+            except Exception:  # noqa: BLE001
+                pass
+        return "auto"
+
     def record_interviewer(self, text: str, auto_ask: bool = True) -> None:
         self.memory.append("[INTERVIEWER]", text)
         CTX.add_transcript("interviewer", text)
         if auto_ask and self._auto_enabled and looks_like_interviewer_prompt(text):
             self._schedule_auto_ask(text)
+        elif auto_ask and looks_like_chitchat(text):
+            print(
+                f"[GEMINI STREAM START] skip chitchat/audio-check: {text[:80]!r}",
+                flush=True,
+            )
 
     def record_candidate(self, text: str) -> None:
         self.memory.append("[CANDIDATE]", text)
         CTX.add_transcript("candidate", text)
 
     def _schedule_auto_ask(self, latest: str) -> None:
-        """Debounce so rapid interviewer chunks don't spam Gemini."""
+        """
+        Debounce rapid chunks, then answer the LATEST interviewer prompt.
+
+        CRITICAL: never drop a new prompt just because Gemini is still streaming
+        the previous (often trivial) turn — cancel + restart instead.
+        """
+        self._pending_auto_text = latest
         if self._debounce_timer is not None:
             self._debounce_timer.cancel()
 
         def _fire() -> None:
-            if CTX.is_ai_streaming:
-                print("[GEMINI STREAM START] skip auto — already streaming", flush=True)
-                return
+            text = self._pending_auto_text
+            mode = self._current_mode()
+            # Prefer coding mode when the utterance is clearly technical
+            if mode == "auto" and looks_like_technical_prompt(text):
+                mode = "coding"
             print(
-                f"[GEMINI STREAM START] AUTO trigger from interviewer: {latest[:100]!r}",
+                f"[GEMINI STREAM START] AUTO trigger from interviewer "
+                f"(mode={mode}, streaming={CTX.is_ai_streaming}): {text[:100]!r}",
                 flush=True,
             )
             self.ask(
-                user_hint="Answer the latest [INTERVIEWER] request now.",
-                mode="auto",
+                user_hint=(
+                    "Answer the LATEST [INTERVIEWER] request now. "
+                    "Ignore prior audio checks / greetings. "
+                    f"Primary request: {text}"
+                ),
+                mode=mode,
                 include_image=True,
                 persist=True,
             )
 
-        self._debounce_timer = threading.Timer(0.55, _fire)
+        # Longer debounce so multi-utterance questions coalesce before Gemini fires
+        self._debounce_timer = threading.Timer(1.1, _fire)
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
 
@@ -246,6 +358,8 @@ class AIOrchestrator:
             "## Live Transcript (last 10 tagged turns)\n"
             "Tags are authoritative. [INTERVIEWER] = question/request. "
             "[CANDIDATE] = what the user already said.\n"
+            "IMPORTANT: Answer ONLY the most recent substantive [INTERVIEWER] ask. "
+            "Ignore earlier mic checks / greetings if a later coding or technical question exists.\n"
             f"{history}",
         ]
         if ocr_text:
@@ -283,9 +397,16 @@ class AIOrchestrator:
         if rolling_context:
             # Compatibility no-op — memory is canonical now
             pass
-        if self._thread and self._thread.is_alive():
-            self.cancel()
-            self._thread.join(timeout=1.0)
+
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            self._cancel.set()  # nudge in-flight stream to stop ASAP
+            old = self._thread
+
+        # Do not block long — generation id makes stale streams inert
+        if old is not None and old.is_alive() and old is not threading.current_thread():
+            old.join(timeout=0.35)
 
         self._cancel.clear()
         self._thread = threading.Thread(
@@ -295,8 +416,9 @@ class AIOrchestrator:
                 "mode": mode,
                 "include_image": include_image,
                 "persist": persist,
+                "generation": generation,
             },
-            name="AIOrchestrator",
+            name=f"AIOrchestrator-{generation}",
             daemon=True,
         )
         self._thread.start()
@@ -322,14 +444,22 @@ class AIOrchestrator:
         mode: str,
         include_image: bool,
         persist: bool,
+        generation: int = 0,
     ) -> None:
+        if generation != self._generation:
+            print(f"[GEMINI STREAM START] skip stale generation={generation}", flush=True)
+            return
+
         CTX.is_ai_streaming = True
         CTX.add_chat("assistant", "", streaming=True)
         BUS.publish(EventType.STATUS, message="Thinking…")
         if self.hub:
             self.hub.ai_started.emit()
             self.hub.emit_status("Thinking…")
-        print(f"[GEMINI STREAM START] mode={mode} hint={user_hint[:80]!r}", flush=True)
+        print(
+            f"[GEMINI STREAM START] gen={generation} mode={mode} hint={user_hint[:80]!r}",
+            flush=True,
+        )
 
         t0 = time.perf_counter()
         full: list[str] = []
@@ -340,13 +470,17 @@ class AIOrchestrator:
             prompt, image = self.build_prompt(user_hint, include_image, mode)
             print(
                 f"[GEMINI STREAM START] calling generate_content_stream "
-                f"model={self.config.gemini_model} prompt_chars={len(prompt)}",
+                f"gen={generation} model={self.config.gemini_model} prompt_chars={len(prompt)}",
                 flush=True,
             )
 
             for token in self._stream_tokens(prompt, image):
-                if self._cancel.is_set():
-                    print("[GEMINI STREAM START] cancelled", flush=True)
+                if generation != self._generation or self._cancel.is_set():
+                    print(
+                        f"[GEMINI STREAM START] cancelled gen={generation} "
+                        f"current={self._generation}",
+                        flush=True,
+                    )
                     break
                 full.append(token)
                 CTX.append_assistant_token(token)
@@ -354,14 +488,26 @@ class AIOrchestrator:
                     self.hub.emit_ai_chunk(token)
                 BUS.publish(EventType.AI_TOKEN, token=token)
 
+            # Stale streams must not paint over a newer answer
+            if generation != self._generation:
+                print(
+                    f"[GEMINI STREAM START] discard stale complete gen={generation}",
+                    flush=True,
+                )
+                return
+
             CTX.finalize_assistant()
             answer = "".join(full).strip()
             elapsed_ms = (time.perf_counter() - t0) * 1000
             log.info("Gemini stream complete %.0fms (%d chars)", elapsed_ms, len(answer))
             print(
-                f"[GEMINI STREAM START] complete chars={len(answer)} latency_ms={elapsed_ms:.0f}",
+                f"[GEMINI STREAM START] complete gen={generation} chars={len(answer)} "
+                f"latency_ms={elapsed_ms:.0f}",
                 flush=True,
             )
+
+            if self._cancel.is_set() and generation != self._generation:
+                return
 
             if not answer:
                 self._emit_error(
@@ -374,24 +520,27 @@ class AIOrchestrator:
                 BUS.publish(EventType.AI_COMPLETE, text=answer, latency_ms=elapsed_ms)
                 BUS.publish(EventType.STATUS, message=f"Answer ready ({elapsed_ms:.0f} ms)")
 
-            if persist and answer and CTX.session_id:
+            if persist and answer and CTX.session_id and generation == self._generation:
                 try:
                     get_db().add_message(
                         CTX.session_id,
                         role="assistant",
                         content=answer,
                         source="ai",
-                        meta={"mode": mode, "latency_ms": elapsed_ms},
+                        meta={"mode": mode, "latency_ms": elapsed_ms, "generation": generation},
                     )
                 except Exception:  # noqa: BLE001
                     log.exception("Failed to persist AI message")
         except Exception as exc:  # noqa: BLE001
+            if generation != self._generation:
+                return
             log.exception("AI orchestration failed")
             CTX.finalize_assistant()
             self._emit_error(f"Gemini error: {exc}")
             BUS.publish(EventType.STATUS, message=f"AI error: {exc}")
         finally:
-            CTX.is_ai_streaming = False
+            if generation == self._generation:
+                CTX.is_ai_streaming = False
 
     def _stream_tokens(self, prompt: str, image_jpeg: bytes | None) -> Generator[str, None, None]:
         kind, client = self._ensure_client()
