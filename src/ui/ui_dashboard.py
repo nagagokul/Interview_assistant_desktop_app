@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
+from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QMouseEvent, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -133,9 +133,20 @@ class OverlayDashboard(QWidget):
         self.setStyleSheet(STYLESHEET)
         self.setWindowTitle("Interview Copilot")
         self.resize(CONFIG.ui.width, CONFIG.ui.height)
-        self.setWindowOpacity(CONFIG.ui.opacity)
         CTX.opacity = CONFIG.ui.opacity
-        CTX.stealth_enabled = CONFIG.ui.stealth_enabled
+        # Prefer visible-first on every cold start. Older builds saved stealth=true
+        # together with Win32 layered alpha, which hid the overlay on some PCs.
+        # Users turn stealth on explicitly from the UI when ready for a call.
+        if CONFIG.ui.stealth_enabled:
+            log.warning("Resetting saved stealth=true → false for safe startup visibility")
+            CONFIG.ui.stealth_enabled = False
+            try:
+                save_config(CONFIG)
+            except Exception:
+                pass
+        CTX.stealth_enabled = False
+        self.setWindowOpacity(CONFIG.ui.opacity)
+        self._sync_stealth_button()
 
         self.setAcceptDrops(True)
         self._apply_window_flags()
@@ -157,12 +168,20 @@ class OverlayDashboard(QWidget):
             | Qt.WindowType.Tool
         )
         self.setWindowFlags(flags)
+        # Solid fill — translucent root + Win32 layered alpha + stealth affinity
+        # made the whole overlay disappear on some Windows builds.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(18, 22, 28))
+        self.setPalette(palette)
 
     def _init_native(self) -> None:
         self.stealth.register(self)
         self.stealth.apply_to(self, CTX.stealth_enabled)
         self.show()
+        self.raise_()
+        self._sync_stealth_button()
         log.info("Overlay native HWND ready; stealth=%s", CTX.stealth_enabled)
 
     def _build_ui(self) -> None:
@@ -203,7 +222,7 @@ class OverlayDashboard(QWidget):
         self.btn_snip.clicked.connect(self.start_snip)
         self.btn_ocr = QPushButton("OCR Watch")
         self.btn_ocr.clicked.connect(self.toggle_ocr)
-        self.btn_stealth = QPushButton("Stealth")
+        self.btn_stealth = QPushButton("Stealth: OFF")
         self.btn_stealth.clicked.connect(self.toggle_stealth)
         self.btn_docs = QPushButton("Docs")
         self.btn_docs.clicked.connect(self.pick_documents)
@@ -294,7 +313,13 @@ class OverlayDashboard(QWidget):
             self.show()
             self.raise_()
             CTX.overlay_visible = True
-            QTimer.singleShot(50, lambda: self.stealth.apply_to(self, CTX.stealth_enabled))
+            QTimer.singleShot(50, self._reapply_stealth_safe)
+
+    def _reapply_stealth_safe(self) -> None:
+        self.stealth.apply_to(self, CTX.stealth_enabled)
+        self.show()
+        self.raise_()
+        self._sync_stealth_button()
 
     def _minimize_to_tray(self) -> None:
         self.hide()
@@ -321,7 +346,7 @@ class OverlayDashboard(QWidget):
         self.ocr.set_region((left, top, right, bottom))
         if getattr(self, "_snip_restore", True):
             self.show()
-            QTimer.singleShot(50, lambda: self.stealth.apply_to(self, CTX.stealth_enabled))
+            QTimer.singleShot(50, self._reapply_stealth_safe)
         # Immediate OCR pass
         text = self.ocr.capture_once()
         if text:
@@ -340,7 +365,37 @@ class OverlayDashboard(QWidget):
         self.stealth.apply_all(enabled)
         CONFIG.ui.stealth_enabled = enabled
         save_config(CONFIG)
-        self._ui_status(f"Stealth {'ON' if enabled else 'OFF'}")
+        self._sync_stealth_button()
+        # Always force local visibility after toggling
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if enabled:
+            # Opacity slider is ignored while stealth is on (Win32 alpha conflict)
+            self.opacity_slider.setEnabled(False)
+            self._ui_status("Stealth ON — hidden from screen share (still visible to you)")
+        else:
+            self.opacity_slider.setEnabled(True)
+            self.setWindowOpacity(CTX.opacity)
+            self._ui_status("Stealth OFF — visible in screen share")
+
+    def _sync_stealth_button(self) -> None:
+        on = CTX.stealth_enabled
+        self.btn_stealth.setText("Stealth: ON" if on else "Stealth: OFF")
+        if hasattr(self, "opacity_slider"):
+            self.opacity_slider.setEnabled(not on)
+
+    def restore_overlay(self) -> None:
+        """Tray / recovery: show overlay and turn stealth off if needed."""
+        self.stealth.reveal(self)
+        CONFIG.ui.stealth_enabled = False
+        save_config(CONFIG)
+        self._sync_stealth_button()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        CTX.overlay_visible = True
+        self._ui_status("Overlay restored (Stealth OFF)")
 
     def pick_documents(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(

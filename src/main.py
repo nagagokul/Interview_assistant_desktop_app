@@ -72,6 +72,7 @@ def main() -> int:
 
     tray = SystemTray(dashboard)
     tray.action_show.triggered.connect(dashboard.toggle_visibility)
+    tray.action_restore.triggered.connect(dashboard.restore_overlay)
     tray.action_listen.triggered.connect(dashboard.toggle_listen)
     tray.action_snip.triggered.connect(dashboard.start_snip)
     tray.action_ask.triggered.connect(dashboard.ask_ai)

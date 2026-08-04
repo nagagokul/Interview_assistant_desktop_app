@@ -37,7 +37,7 @@ class AppContext:
         self._history_limit = history_limit
 
         self.session_id: str | None = None
-        self.stealth_enabled: bool = True
+        self.stealth_enabled: bool = False
         self.opacity: float = 0.92
         self.overlay_visible: bool = True
 

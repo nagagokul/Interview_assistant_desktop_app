@@ -119,6 +119,7 @@ Double-click `InterviewCopilot.exe`. A tray icon appears; the frameless overlay 
 | No interviewer transcripts | Ensure call audio plays through speakers/headphones; grant mic privacy; try Stereo Mix / WASAPI |
 | OCR empty | Install Tesseract; verify `tesseract --version` in cmd |
 | Overlay appears in screen share | Toggle **Stealth** off/on; requires Windows 10 2004+ |
+| **Overlay vanishes after Stealth ON** | Bug in older builds (Win32 layered alpha + capture exclusion). **Pull latest**, restart. Recovery now: tray icon → **Restore Overlay (if invisible)** or **Toggle Stealth**. Stealth keeps the window visible to you while hiding it from Zoom/Teams/Meet. |
 | Hotkeys do nothing | Run EXE as the logged-in user (not a different elevated account); `keyboard` needs input access |
 | High CPU | Stop OCR Watch when idle; reduce opacity animations; close unused browser tabs |
 

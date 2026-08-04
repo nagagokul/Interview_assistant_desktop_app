@@ -9,8 +9,8 @@ STYLESHEET = """
 }
 
 QWidget#OverlayRoot {
-    background-color: rgba(18, 22, 28, 230);
-    border: 1px solid rgba(90, 110, 140, 80);
+    background-color: #12161C;
+    border: 1px solid rgba(90, 110, 140, 120);
     border-radius: 10px;
 }
 

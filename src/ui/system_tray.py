@@ -38,6 +38,7 @@ class SystemTray(QSystemTrayIcon):
         self.setToolTip("Interview Copilot")
         menu = QMenu()
         self.action_show = QAction("Show / Hide Overlay", menu)
+        self.action_restore = QAction("Restore Overlay (if invisible)", menu)
         self.action_listen = QAction("Start Listening", menu)
         self.action_snip = QAction("Select OCR Region", menu)
         self.action_ask = QAction("Ask AI (context)", menu)
@@ -45,6 +46,7 @@ class SystemTray(QSystemTrayIcon):
         self.action_quit = QAction("Quit", menu)
         for a in (
             self.action_show,
+            self.action_restore,
             self.action_listen,
             self.action_snip,
             self.action_ask,
