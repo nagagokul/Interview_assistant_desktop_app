@@ -1,0 +1,14 @@
+# Optional extras — install ONLY on Python 3.11/3.12 with wheels available.
+# These require Microsoft C++ Build Tools on Python 3.14 (not recommended).
+#
+#   pip install -r requirements-optional.txt
+#
+# App already falls back:
+#   - VAD → energy gate if webrtcvad missing
+#   - RAG → local JSON/NumPy index if chromadb missing
+#   - Gemini → google-genai SDK (google-generativeai is legacy fallback)
+
+webrtcvad-wheels>=2.0.14; platform_system=="Windows" and python_version < "3.13"
+webrtcvad>=2.0.10; platform_system!="Windows" and python_version < "3.13"
+chromadb>=0.5.0,<1; python_version < "3.13"
+google-generativeai>=0.8.0

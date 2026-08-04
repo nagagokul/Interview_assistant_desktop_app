@@ -12,12 +12,14 @@ All persistent data lives under `%APPDATA%\Copilot\` (Windows) or `~/.copilot/` 
 ├── data/
 │   ├── copilot.db       # SQLite (WAL)
 │   ├── .master.key      # Fernet key (0600)
-│   └── settings.json    # non-secret UI prefs
-├── chroma/              # ChromaDB persistent index
+│   ├── settings.json    # non-secret UI prefs
+│   └── rag_index.json   # local NumPy/hash vector index (no C++)
 ├── documents/           # uploaded resume / JD / notes
 └── cache/
 ```
 
+> ChromaDB under `chroma/` is optional. If `chromadb` is not installed (common on
+> Python 3.14 without MSVC), the app uses `data/rag_index.json` only.
 ## Encryption
 
 - Algorithm: **Fernet** (AES-128-CBC + HMAC-SHA256) via `cryptography`
@@ -82,11 +84,11 @@ CREATE TABLE embedded_paths (
 );
 ```
 
-## Chroma Collection
+## Chroma / Local Collection
 
-- Name: `interview_docs` (configurable)
+- Default: `data/rag_index.json` with hash embeddings + cosine search (no native build)
+- Optional: Chroma collection `interview_docs` when `chromadb` is installed
 - Metadata per chunk: `doc_id`, `filename`, `doc_type`, `chunk`
-- Embedding: MiniLM if available, else deterministic hash embedder (384-d) for low RAM
 
 ## settings.json (plain)
 

@@ -39,6 +39,24 @@ def test_chunk_text_overlap() -> None:
     assert all(len(c) <= 240 for c in chunks)
 
 
+def test_local_vector_store_roundtrip(tmp_path: Path) -> None:
+    from src.services.rag_service import LocalVectorStore
+
+    store = LocalVectorStore(tmp_path / "rag.json", dim=64)
+    store.add(
+        ids=["a_0", "b_0"],
+        documents=["python asyncio event loop interview", "gardening tomatoes and soil"],
+        metadatas=[{"doc_id": "a", "filename": "resume.txt"}, {"doc_id": "b", "filename": "notes.txt"}],
+    )
+    docs, metas = store.query("asyncio interview python", top_k=1)
+    assert docs
+    assert "asyncio" in docs[0]
+    assert metas[0]["filename"] == "resume.txt"
+    # reload
+    store2 = LocalVectorStore(tmp_path / "rag.json", dim=64)
+    assert store2.count() == 2
+
+
 def test_pixel_change_ratio() -> None:
     from src.utils.image_diff import pixel_change_ratio
 
