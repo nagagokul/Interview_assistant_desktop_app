@@ -305,21 +305,27 @@ class AudioPipeline(QObject):
             self.pipeline_error.emit(msg)
             return
 
+        # Dump device map once for field diagnostics
+        self._dump_devices()
+
         mic = self._find_mic_device()
         loopback = self._find_loopback_device()
 
-        # mic=None is valid — sounddevice uses the OS default input device
+        # CRITICAL: never open WASAPI loopback with device=None — that can
+        # accidentally capture the microphone and duplicate every transcript.
         if loopback is None:
-            self.pipeline_error.emit(
-                "No WASAPI loopback device found — interviewer capture may be unavailable. "
-                "Play call audio through speakers/headphones."
+            msg = (
+                "No WASAPI loopback/output device resolved — interviewer capture DISABLED. "
+                "Play Zoom/Teams through speakers/headphones and retry Listen."
             )
+            print(f"[PIPELINE ERROR] {msg}", flush=True)
+            self.pipeline_error.emit(msg)
 
         # Candidate mic thread — NEVER loopback
         self._mic_thread = _CaptureWorker(
             tag="[CANDIDATE]",
             loopback=False,
-            device=mic,  # None ⇒ system default mic
+            device=mic,  # None ⇒ system default mic (OK)
             config=self.config,
         )
         self._mic_thread.utterance_ready.connect(self._on_utterance)
@@ -346,11 +352,41 @@ class AudioPipeline(QObject):
             t.start()
 
         self._running = True
-        self.pipeline_status.emit("Listening — mic + WASAPI loopback isolated")
+        status = (
+            "Listening — mic + WASAPI loopback isolated"
+            if loopback is not None
+            else "Listening — mic only (no loopback device)"
+        )
+        self.pipeline_status.emit(status)
         print(
             f"[AUDIO CAPTURED] pipeline started mic={mic!r} loopback={loopback!r}",
             flush=True,
         )
+
+    def _dump_devices(self) -> None:
+        try:
+            import sounddevice as sd
+            from src.utils.audio_devices import split_default_device
+
+            default = sd.default.device
+            inn, out = split_default_device(default)
+            print(
+                f"[AUDIO CAPTURED] sd.default.device type={type(default).__name__} "
+                f"raw={default!r} input={inn!r} output={out!r}",
+                flush=True,
+            )
+            for i, d in enumerate(sd.query_devices()):
+                try:
+                    host = sd.query_hostapis(d["hostapi"])["name"]
+                except Exception:
+                    host = "?"
+                print(
+                    f"[AUDIO CAPTURED] device[{i}] in={d['max_input_channels']} "
+                    f"out={d['max_output_channels']} host={host} name={d['name']!r}",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[PIPELINE ERROR] device dump failed: {exc}", flush=True)
 
     def stop(self) -> None:
         for t in (self._mic_thread, self._loop_thread):

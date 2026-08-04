@@ -413,11 +413,21 @@ class OverlayDashboard(QWidget):
 
     def toggle_listen(self) -> None:
         if self.audio.running:
+            print("[AUDIO CAPTURED] Listen button → STOP", flush=True)
             self.audio.stop()
             self.btn_listen.setText("Listen")
+            self._on_status("Audio stopped")
         else:
+            print("[AUDIO CAPTURED] Listen button → START", flush=True)
+            self._append_log("Listen clicked — starting mic + WASAPI loopback")
             self.audio.start()
-            self.btn_listen.setText("Stop")
+            if self.audio.running:
+                self.btn_listen.setText("Stop")
+                self._on_status("Listening…")
+            else:
+                self.btn_listen.setText("Listen")
+                self._on_status("Listen failed — see pipeline log / console")
+                self._append_log("Listen failed to start — check GROQ_API_KEY and audio devices")
 
     def start_snip(self) -> None:
         was_visible = self.isVisible()
