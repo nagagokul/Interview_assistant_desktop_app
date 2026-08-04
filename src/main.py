@@ -67,9 +67,11 @@ def main() -> int:
     audio = AudioCaptureService(hub=hub)
     ocr = OCRRegionService()
     ai = AIOrchestrator(hub=hub)
+    audio.set_ai(ai)
     rag = RAGManager()
     stealth = StealthService()
     hotkeys = KeyHookService()
+    print("[UI ROUTE] AudioPipeline + AIOrchestrator wired (echo suppress + auto-ask)", flush=True)
 
     # Bridge OCR EventBus → hub so OCR also lands on the GUI thread safely
     from src.core.event_bus import BUS, Event, EventType
