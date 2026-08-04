@@ -32,16 +32,19 @@ On launch you should see:
 ┌─────────────────────────────────────────────┐
 │ Interview Copilot          status    Hide ✕ │
 ├─────────────────────────────────────────────┤
-│ [Listen] [OCR Region] [OCR Watch]           │
-│ [Stealth] [Docs]                            │
+│ [Listen] [OCR Region] [OCR Watch] …         │
 ├─────────────────────────────────────────────┤
 │ Opacity ────────●────────                   │
 ├─────────────────────────────────────────────┤
-│ Tabs:  Live  |  Assistant  |  OCR           │
+│ Live Conversation Stream   (TOP)            │
+│  ┌ blue Interviewer bubble (left) ─────┐    │
+│  │              grey You bubble (right) ┘    │
 │                                             │
-│  Live = Interviewer transcript | Your mic   │
-│  Assistant = AI answers (streaming)         │
-│  OCR = text captured from the screen region │
+│ ─── splitter ─────────────────────────────  │
+│ AI Copilot Core Guidance   (BOTTOM)         │
+│  streaming Markdown / code / complexity     │
+├─────────────────────────────────────────────┤
+│ OCR peek                                    │
 ├─────────────────────────────────────────────┤
 │ [mode ▼]  [hint or question…]      [Ask]    │
 └─────────────────────────────────────────────┘
@@ -54,9 +57,17 @@ On launch you should see:
 | **OCR Watch** | Continuously re-reads that region when pixels change |
 | **Stealth** | Toggles screen-share invisibility (`WDA_EXCLUDEFROMCAPTURE`) |
 | **Docs** | File picker to upload resume / JD / notes for RAG |
-| **Opacity** | Makes the overlay more or less transparent |
+| **Clear** | Clears conversation + AI panels |
+| **Opacity** | Makes the overlay more or less transparent (disabled while Stealth is ON) |
 | **Mode** | `auto` · `coding` · `system_design` · `behavioral` · `debug` |
-| **Ask** | Sends live transcript + OCR + resume context to Gemini |
+| **Ask** | Sends live transcript + OCR + resume context to Gemini (streams into bottom panel) |
+
+Terminal verification logs (watch these if text does not appear):
+
+```
+[AUDIO CAPTURED] → [GROQ TRANSCRIPT RECEIVED] → [UI TEXT APPENDED]
+[GEMINI STREAM START] → [UI TEXT APPENDED] ai_chunk …
+```
 
 ---
 
