@@ -1,0 +1,41 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# App runtime (local)
+*.db
+*.log
+.master.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Large native bundles (download separately)
+assets/tesseract/**
+!assets/tesseract/README.txt
