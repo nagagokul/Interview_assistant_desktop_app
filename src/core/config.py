@@ -50,12 +50,50 @@ class OCRConfig:
 
 @dataclass
 class AIConfig:
-    gemini_model: str = "gemini-1.5-flash"
+    # gemini-1.5-flash was shut down; gemini-flash-latest tracks current Flash GA
+    gemini_model: str = "gemini-flash-latest"
     groq_model: str = "whisper-large-v3"
     temperature: float = 0.35
     max_output_tokens: int = 2048
     stream: bool = True
     system_prompt_file: str = "system_interview.txt"
+
+
+# Shut-down / retired model ids → current Flash alias (Aug 2026+)
+_GEMINI_MODEL_ALIASES: dict[str, str] = {
+    "gemini-1.5-flash": "gemini-flash-latest",
+    "gemini-1.5-flash-latest": "gemini-flash-latest",
+    "gemini-1.5-flash-001": "gemini-flash-latest",
+    "gemini-1.5-flash-8b": "gemini-flash-latest",
+    "gemini-1.5-pro": "gemini-pro-latest",
+    "gemini-1.5-pro-latest": "gemini-pro-latest",
+    "gemini-2.0-flash": "gemini-flash-latest",
+    "gemini-2.0-flash-001": "gemini-flash-latest",
+    "gemini-2.0-flash-lite": "gemini-flash-latest",
+    "gemini-2.0-flash-lite-001": "gemini-flash-latest",
+    "models/gemini-1.5-flash": "gemini-flash-latest",
+    "models/gemini-2.0-flash": "gemini-flash-latest",
+}
+
+# Tried in order when the configured model returns 404 NOT_FOUND
+GEMINI_MODEL_FALLBACKS: tuple[str, ...] = (
+    "gemini-flash-latest",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+)
+
+
+def normalize_gemini_model(model: str | None) -> str:
+    """Map retired Gemini model ids to a living Flash/Pro alias."""
+    raw = (model or "").strip() or "gemini-flash-latest"
+    key = raw.lower()
+    if key.startswith("models/"):
+        key = key[len("models/") :]
+        raw = raw[len("models/") :] if raw.lower().startswith("models/") else raw
+    mapped = _GEMINI_MODEL_ALIASES.get(key) or _GEMINI_MODEL_ALIASES.get(raw.lower())
+    return mapped or raw
 
 
 @dataclass
@@ -152,6 +190,9 @@ def load_config() -> AppConfig:
         cfg.ai.gemini_model = model
     if model := os.environ.get("GROQ_WHISPER_MODEL"):
         cfg.ai.groq_model = model
+
+    # Remap retired models (e.g. gemini-1.5-flash → gemini-flash-latest)
+    cfg.ai.gemini_model = normalize_gemini_model(cfg.ai.gemini_model)
 
     return cfg
 

@@ -253,3 +253,13 @@ def test_open_wasapi_loopback_raises_without_backends(monkeypatch: pytest.Monkey
     monkeypatch.setattr(wl, "open_loopback_stereo_mix", lambda target_rate=16000: None)
     with pytest.raises(RuntimeError, match="WASAPI loopback"):
         wl.open_wasapi_loopback()
+
+
+def test_normalize_gemini_model_remaps_retired_ids() -> None:
+    from src.core.config import normalize_gemini_model, AIConfig
+
+    assert normalize_gemini_model("gemini-1.5-flash") == "gemini-flash-latest"
+    assert normalize_gemini_model("models/gemini-1.5-flash") == "gemini-flash-latest"
+    assert normalize_gemini_model("gemini-2.0-flash") == "gemini-flash-latest"
+    assert normalize_gemini_model("gemini-3.5-flash") == "gemini-3.5-flash"
+    assert AIConfig().gemini_model == "gemini-flash-latest"

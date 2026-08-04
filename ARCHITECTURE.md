@@ -46,7 +46,7 @@ with 8 GB RAM stays fluid.
               ┌──────────────────────────────────────────────────┐
               │           AIOrchestrator (streaming)              │
               │  system prompt + RAG + transcript + OCR image     │
-              │  → Google AI Studio  gemini-1.5-flash             │
+              │  → Google AI Studio  gemini-flash-latest           │
               │  target < 400 ms first token / < 2 s full answer  │
               └───────────────────────┬──────────────────────────┘
                                       │ token stream (<30 ms UI)
