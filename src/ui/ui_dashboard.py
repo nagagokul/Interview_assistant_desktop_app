@@ -330,6 +330,10 @@ class OverlayDashboard(QWidget):
     def _on_status(self, message: str) -> None:
         self.status.setText(message)
         CTX.set_status(message)
+        # Surface pipeline/device errors in the diagnostic strip too
+        lower = (message or "").lower()
+        if any(k in lower for k in ("error", "fail", "missing", "unavailable", "no microphone", "no wasapi")):
+            self._append_log(message)
 
     def _persist_transcript(self, speaker: str, text: str) -> None:
         if not CTX.session_id:
