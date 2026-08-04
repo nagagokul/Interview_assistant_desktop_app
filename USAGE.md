@@ -108,10 +108,21 @@ Drag the overlay by clicking the title area. Use the tray icon → **Quit** to e
 
 1. Join the interview call with audio playing through **speakers or headphones** (needed for interviewer loopback).
 2. Click **Listen**.
-3. Open the **Live** tab:
-   - Left = **Interviewer** (system audio)
-   - Right = **You** (microphone)
-4. Speak a test sentence and confirm your side updates. Ask the interviewer to speak (or play a short test) and confirm their side updates.
+3. Watch the **Live Conversation Stream**:
+   - **Blue (left)** = Interviewer only (WASAPI loopback)
+   - **Grey (right)** = You only (microphone)
+4. Speak a test sentence — only the grey bubble should update.
+5. Play interviewer audio — only the blue bubble should update.
+6. If the same line appears on both sides, an older build had speaker→mic echo; latest builds suppress that automatically.
+
+When the interviewer asks something (even without `?`, e.g. “write a code in C++…”), the **bottom AI panel** should auto-stream an answer. You can also press **Ask** / `Alt+Enter`.
+
+Watch PowerShell for:
+```
+[AUDIO CAPTURED] → [GROQ TRANSCRIPT RECEIVED] → [DIARIZATION] KEEP/ECHO SUPPRESSED
+→ [UI TEXT APPENDED] → [GEMINI STREAM START] → [UI TEXT APPENDED] ai_chunk
+```
+Pipeline errors also appear in the red **Pipeline log** strip on the overlay.
 
 ### 4. Get AI help during the interview
 
