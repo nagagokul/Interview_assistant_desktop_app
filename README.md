@@ -37,7 +37,18 @@ build.bat
 dist\InterviewCopilot\InterviewCopilot.exe
 ```
 
-Full setup: **[INSTALL.md](INSTALL.md)** · Architecture: **[ARCHITECTURE.md](ARCHITECTURE.md)** · Storage: **[SCHEMA.md](SCHEMA.md)**
+Full setup: **[INSTALL.md](INSTALL.md)** · **How to use: [USAGE.md](USAGE.md)** · Architecture: **[ARCHITECTURE.md](ARCHITECTURE.md)** · Storage: **[SCHEMA.md](SCHEMA.md)**
+
+## How to use (short version)
+
+1. Launch with `python main.py` (after install).
+2. Turn **Stealth** ON and drop your **resume** onto the overlay.
+3. Press `Alt+S`, drag a box over the coding pad / problem, then click **OCR Watch**.
+4. Click **Listen** so interviewer (speakers) and you (mic) are transcribed.
+5. Press `Alt+Enter` (or **Ask**) for a context-aware answer in the **Assistant** tab.
+6. Press `Alt+H` anytime to hide/show the overlay.
+
+Step-by-step walkthrough, modes, and checklist: **[USAGE.md](USAGE.md)**
 
 ## Production Folder Structure
 
