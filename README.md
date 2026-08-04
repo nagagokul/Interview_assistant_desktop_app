@@ -15,15 +15,20 @@ Near-instant coaching for coding interviews, system design, debugging, and STAR 
 
 ## Quick Start
 
+Use **Python 3.11 or 3.12** (avoid 3.14 — missing native wheels for optional deps).
+
 ```bat
 copy .env.example .env
 REM edit .env with GROQ_API_KEY and GOOGLE_API_KEY
 
-python -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
+
+Core install needs **no Microsoft C++ Build Tools**. ChromaDB / webrtcvad are optional
+(`requirements-optional.txt`); the app falls back to energy-based VAD and a local JSON RAG index.
 
 Build a portable app:
 

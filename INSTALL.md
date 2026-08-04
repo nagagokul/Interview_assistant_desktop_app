@@ -4,8 +4,13 @@ Designed for **Windows 10/11**, Intel i5-class CPUs, **8 GB RAM**. No Electron, 
 
 ## 1. Prerequisites
 
-1. **Python 3.11 or 3.12 (64-bit)** from https://www.python.org/downloads/  
-   During setup, enable **“Add python.exe to PATH”**.
+1. **Python 3.11 or 3.12 (64-bit) — strongly recommended**  
+   Download: https://www.python.org/downloads/release/python-31210/  
+   During setup, enable **“Add python.exe to PATH”** and **“py launcher”**.  
+   > **Avoid Python 3.14 for now.** Many packages (`chroma-hnswlib`, `webrtcvad`) have no
+   > Windows wheels for 3.14, so pip tries to compile them and fails with
+   > `Microsoft Visual C++ 14.0 is required`. This repo’s core `requirements.txt` no longer
+   > needs those packages, but 3.11/3.12 is still the smoothest path.
 2. **API keys**
    - Groq: https://console.groq.com → create key for `whisper-large-v3`
    - Google AI Studio: https://aistudio.google.com/apikey → key for `gemini-1.5-flash`
@@ -34,11 +39,21 @@ The app also loads `%APPDATA%\Copilot\.env` if present (useful after packaging).
 
 ## 3. Dev Run (before packaging)
 
+Prefer creating a venv with **3.12** explicitly:
+
 ```bat
-python -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 python main.py
+```
+
+If you only have Python 3.14 installed, the slim `requirements.txt` still works
+(no Chroma / no webrtcvad compile). Optional extras:
+
+```bat
+pip install -r requirements-optional.txt
 ```
 
 First launch creates:
@@ -48,7 +63,7 @@ First launch creates:
   logs\copilot.log
   data\copilot.db          (Fernet-encrypted history)
   data\.master.key
-  chroma\                  (local vector index)
+  data\rag_index.json      (local vector index — no C++ needed)
   documents\               (uploaded resumes / JDs)
 ```
 
@@ -98,12 +113,34 @@ Double-click `InterviewCopilot.exe`. A tray icon appears; the frameless overlay 
 
 | Symptom | Fix |
 |---------|-----|
+| `Failed building wheel for chroma-hnswlib / webrtcvad` | You hit packages that need MSVC on Python 3.14. **Pull latest code** and use slim `requirements.txt` (Chroma/VAD are optional). Or install **Python 3.12** and recreate the venv. |
+| `Microsoft Visual C++ 14.0 or greater is required` | Do **not** install Build Tools just for this app. Switch to Python 3.11/3.12, or stay on the slim requirements (energy VAD + local RAG). |
 | “Missing API keys” dialog | Place `.env` beside EXE or in `%APPDATA%\Copilot\.env` |
 | No interviewer transcripts | Ensure call audio plays through speakers/headphones; grant mic privacy; try Stereo Mix / WASAPI |
 | OCR empty | Install Tesseract; verify `tesseract --version` in cmd |
 | Overlay appears in screen share | Toggle **Stealth** off/on; requires Windows 10 2004+ |
 | Hotkeys do nothing | Run EXE as the logged-in user (not a different elevated account); `keyboard` needs input access |
 | High CPU | Stop OCR Watch when idle; reduce opacity animations; close unused browser tabs |
+
+### Fix the exact pip error you hit (Python 3.14)
+
+```bat
+cd D:\Interview_assistant_desktop_app
+git pull
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python main.py
+```
+
+Better long-term (recommended):
+
+```bat
+REM Install Python 3.12 from python.org, then:
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
 
 ## 8. Uninstall
 

@@ -1,24 +1,29 @@
 """
-RAGManager — lightweight local document chunking + ChromaDB vector index.
+RAGManager — lightweight local document chunking + vector index.
 
-Optimized for 8GB RAM: uses in-process Chroma with a small sentence-transformer
-embedding model (or hash embeddings fallback if torch is too heavy).
+Default backend: pure-Python/NumPy hash embeddings persisted as JSON
+(no C++ build tools, works on Python 3.14 / 8GB RAM machines).
+
+Optional backend: ChromaDB when installed and importable.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+import numpy as np
 
 from src.core.config import CONFIG
 from src.core.context import CTX
 from src.core.event_bus import BUS, EventType
 from src.core.logging_setup import get_logger
-from src.core.paths import chroma_dir, documents_dir
+from src.core.paths import chroma_dir, data_dir, documents_dir
 from src.data.database import get_db
 
 log = get_logger("rag")
@@ -46,7 +51,6 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str
     n = len(text)
     while start < n:
         end = min(n, start + chunk_size)
-        # Prefer break on sentence boundary
         window = text[start:end]
         if end < n:
             for sep in (". ", "? ", "! ", "\n"):
@@ -62,23 +66,14 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str
     return [c for c in chunks if c]
 
 
-class HashEmbeddingFunction:
-    """
-    Zero-dependency bag-of-hashes embedding for ultra-low RAM machines.
-    Dimensionality is fixed; quality is lower than MiniLM but keeps the app fluid.
-    """
+class HashEmbedder:
+    """Zero-dependency bag-of-hashes embeddings (no torch / no MSVC)."""
 
     def __init__(self, dim: int = 384) -> None:
         self.dim = dim
 
-    def name(self) -> str:
-        return "hash-embed-v1"
-
-    def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: A003 — chroma API
-        return [self._embed(t) for t in input]
-
-    def _embed(self, text: str) -> list[float]:
-        vec = [0.0] * self.dim
+    def embed(self, text: str) -> np.ndarray:
+        vec = np.zeros(self.dim, dtype=np.float32)
         tokens = re.findall(r"[a-z0-9_]+", text.lower())
         if not tokens:
             return vec
@@ -87,56 +82,139 @@ class HashEmbeddingFunction:
             idx = h % self.dim
             sign = 1.0 if (h >> 8) & 1 else -1.0
             vec[idx] += sign
-        # L2 normalize
-        norm = sum(v * v for v in vec) ** 0.5 or 1.0
-        return [v / norm for v in vec]
+        norm = float(np.linalg.norm(vec)) or 1.0
+        return vec / norm
+
+    def embed_many(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        return np.vstack([self.embed(t) for t in texts])
+
+
+class LocalVectorStore:
+    """JSON-persisted cosine index — no native extensions required."""
+
+    def __init__(self, path: Path, dim: int = 384) -> None:
+        self.path = path
+        self.embedder = HashEmbedder(dim=dim)
+        self.ids: list[str] = []
+        self.documents: list[str] = []
+        self.metadatas: list[dict[str, Any]] = []
+        self.vectors: np.ndarray = np.zeros((0, dim), dtype=np.float32)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.is_file():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            self.ids = list(payload.get("ids", []))
+            self.documents = list(payload.get("documents", []))
+            self.metadatas = list(payload.get("metadatas", []))
+            vectors = payload.get("vectors", [])
+            if vectors:
+                self.vectors = np.asarray(vectors, dtype=np.float32)
+            else:
+                self.vectors = self.embedder.embed_many(self.documents)
+            log.info("Loaded local vector store (%d chunks) from %s", len(self.ids), self.path)
+        except Exception:  # noqa: BLE001
+            log.exception("Failed loading local vector store — starting empty")
+            self.ids, self.documents, self.metadatas = [], [], []
+            self.vectors = np.zeros((0, self.embedder.dim), dtype=np.float32)
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ids": self.ids,
+            "documents": self.documents,
+            "metadatas": self.metadatas,
+            "vectors": self.vectors.tolist(),
+        }
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def delete_where_doc_id(self, doc_id: str) -> None:
+        keep = [i for i, m in enumerate(self.metadatas) if m.get("doc_id") != doc_id]
+        if len(keep) == len(self.ids):
+            return
+        self.ids = [self.ids[i] for i in keep]
+        self.documents = [self.documents[i] for i in keep]
+        self.metadatas = [self.metadatas[i] for i in keep]
+        self.vectors = self.vectors[keep] if keep else np.zeros((0, self.embedder.dim), dtype=np.float32)
+
+    def add(self, ids: list[str], documents: list[str], metadatas: list[dict[str, Any]]) -> None:
+        vecs = self.embedder.embed_many(documents)
+        self.ids.extend(ids)
+        self.documents.extend(documents)
+        self.metadatas.extend(metadatas)
+        self.vectors = np.vstack([self.vectors, vecs]) if self.vectors.size else vecs
+        self.save()
+
+    def query(self, text: str, top_k: int = 4) -> tuple[list[str], list[dict[str, Any]]]:
+        if not self.documents:
+            return [], []
+        q = self.embedder.embed(text)
+        # Cosine similarity (vectors are L2-normalized)
+        scores = self.vectors @ q
+        k = min(top_k, len(scores))
+        idx = np.argpartition(-scores, kth=k - 1)[:k]
+        idx = idx[np.argsort(-scores[idx])]
+        docs = [self.documents[i] for i in idx]
+        metas = [self.metadatas[i] for i in idx]
+        return docs, metas
+
+    def count(self) -> int:
+        return len(self.ids)
 
 
 class RAGManager:
     def __init__(self) -> None:
         self.config = CONFIG.rag
         self._lock = threading.RLock()
-        self._client: Any = None
         self._collection: Any = None
-        self._embedder: Any = None
+        self._local: LocalVectorStore | None = None
+        self._backend = "none"
         self._init_store()
 
     def _init_store(self) -> None:
+        # Prefer pure-local store (always works). Optionally try Chroma.
+        try:
+            store_path = data_dir() / "rag_index.json"
+            self._local = LocalVectorStore(store_path, dim=384)
+            self._backend = "local"
+            log.info("RAG backend=local chunks=%d", self._local.count())
+        except Exception:  # noqa: BLE001
+            log.exception("Local RAG store failed to init")
+            self._local = None
+
         try:
             import chromadb
             from chromadb.config import Settings
 
-            self._embedder = self._build_embedder()
-            self._client = chromadb.PersistentClient(
+            class _HashEF:
+                def __init__(self) -> None:
+                    self._h = HashEmbedder(384)
+
+                def name(self) -> str:
+                    return "hash-embed-v1"
+
+                def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: A003
+                    return [self._h.embed(t).tolist() for t in input]
+
+            client = chromadb.PersistentClient(
                 path=str(chroma_dir()),
                 settings=Settings(anonymized_telemetry=False, allow_reset=True),
             )
-            self._collection = self._client.get_or_create_collection(
+            self._collection = client.get_or_create_collection(
                 name=self.config.collection_name,
                 metadata={"hnsw:space": "cosine"},
-                embedding_function=self._embedder,
+                embedding_function=_HashEF(),
             )
-            log.info(
-                "Chroma ready collection=%s count=%s",
-                self.config.collection_name,
-                self._collection.count(),
-            )
+            self._backend = "chroma+local"
+            log.info("Chroma also available (optional) count=%s", self._collection.count())
         except Exception:  # noqa: BLE001
-            log.exception("ChromaDB init failed — RAG disabled")
-            self._client = None
+            # Expected on Python 3.14 / machines without MSVC — local store is enough
+            log.info("ChromaDB not available — using local JSON vector store only")
             self._collection = None
-
-    def _build_embedder(self) -> Any:
-        # Try lightweight sentence-transformers; fall back to hash embedder
-        try:
-            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-
-            ef = SentenceTransformerEmbeddingFunction(model_name=self.config.embed_model)
-            log.info("Using SentenceTransformer embeddings: %s", self.config.embed_model)
-            return ef
-        except Exception:  # noqa: BLE001
-            log.warning("SentenceTransformer unavailable — using hash embeddings (low RAM mode)")
-            return HashEmbeddingFunction(dim=384)
 
     # ---- document IO ----
 
@@ -157,23 +235,25 @@ class RAGManager:
         chunks = chunk_text(text, self.config.chunk_size, self.config.chunk_overlap)
         checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
         doc_id = checksum[:16]
+        ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
+        metadatas = [
+            {"doc_id": doc_id, "filename": src.name, "doc_type": dtype, "chunk": i}
+            for i in range(len(chunks))
+        ]
 
         with self._lock:
+            if self._local is not None:
+                self._local.delete_where_doc_id(doc_id)
+                self._local.add(ids=ids, documents=chunks, metadatas=metadatas)
+
             if self._collection is not None:
-                # Remove prior chunks for same doc
                 try:
                     existing = self._collection.get(where={"doc_id": doc_id})
                     if existing and existing.get("ids"):
                         self._collection.delete(ids=existing["ids"])
+                    self._collection.add(ids=ids, documents=chunks, metadatas=metadatas)
                 except Exception:  # noqa: BLE001
-                    pass
-
-                ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-                metadatas = [
-                    {"doc_id": doc_id, "filename": src.name, "doc_type": dtype, "chunk": i}
-                    for i in range(len(chunks))
-                ]
-                self._collection.add(ids=ids, documents=chunks, metadatas=metadatas)
+                    log.exception("Chroma ingest failed (local store still updated)")
 
         record = get_db().upsert_document(
             filename=src.name,
@@ -184,7 +264,6 @@ class RAGManager:
             doc_id=doc_id,
         )
 
-        # Promote resume/JD into context slots
         if dtype == "resume":
             CTX.resume_summary = text[:6000]
         elif dtype == "jd":
@@ -198,7 +277,7 @@ class RAGManager:
             doc_type=dtype,
         )
         BUS.publish(EventType.STATUS, message=f"Indexed {src.name} ({len(chunks)} chunks)")
-        log.info("Indexed %s type=%s chunks=%d", src.name, dtype, len(chunks))
+        log.info("Indexed %s type=%s chunks=%d backend=%s", src.name, dtype, len(chunks), self._backend)
         return {
             "doc_id": record.id,
             "filename": record.filename,
@@ -207,23 +286,26 @@ class RAGManager:
         }
 
     def query(self, text: str, top_k: int | None = None) -> str:
-        if not text.strip() or self._collection is None:
+        if not text.strip():
             return ""
         k = top_k or self.config.top_k
+        docs: list[str] = []
+        metas: list[dict[str, Any]] = []
+
         with self._lock:
-            result = self._collection.query(query_texts=[text], n_results=k)
-        docs = (result.get("documents") or [[]])[0]
-        metas = (result.get("metadatas") or [[]])[0]
-        blocks: list[str] = []
-        for doc, meta in zip(docs, metas):
-            name = (meta or {}).get("filename", "doc")
-            blocks.append(f"[{name}] {doc}")
+            if self._local is not None and self._local.count() > 0:
+                docs, metas = self._local.query(text, top_k=k)
+            elif self._collection is not None:
+                result = self._collection.query(query_texts=[text], n_results=k)
+                docs = (result.get("documents") or [[]])[0]
+                metas = (result.get("metadatas") or [[]])[0]
+
+        blocks = [f"[{(meta or {}).get('filename', 'doc')}] {doc}" for doc, meta in zip(docs, metas)]
         joined = "\n\n".join(blocks)
         CTX.rag_context = joined
         return joined
 
     def refresh_context_from_latest(self) -> str:
-        """Pull RAG context using latest transcript + OCR as the query."""
         q = " ".join(
             [
                 CTX.transcript_block(8),
@@ -248,6 +330,9 @@ class RAGManager:
 
     def delete_document(self, doc_id: str) -> None:
         with self._lock:
+            if self._local is not None:
+                self._local.delete_where_doc_id(doc_id)
+                self._local.save()
             if self._collection is not None:
                 try:
                     existing = self._collection.get(where={"doc_id": doc_id})
@@ -267,7 +352,6 @@ class RAGManager:
             return self._extract_pdf(path)
         if suffix in {".docx"}:
             return self._extract_docx(path)
-        # Best-effort binary decode
         return path.read_text(encoding="utf-8", errors="ignore")
 
     def _extract_pdf(self, path: Path) -> str:
@@ -275,17 +359,14 @@ class RAGManager:
             from pypdf import PdfReader
 
             reader = PdfReader(str(path))
-            pages = []
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            return "\n".join(pages)
+            return "\n".join((page.extract_text() or "") for page in reader.pages)
         except Exception:  # noqa: BLE001
             log.exception("PDF extract failed for %s", path)
             return ""
 
     def _extract_docx(self, path: Path) -> str:
         try:
-            import docx  # python-docx
+            import docx
 
             document = docx.Document(str(path))
             return "\n".join(p.text for p in document.paragraphs)
