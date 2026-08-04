@@ -123,6 +123,7 @@ Full walkthrough with overlay map, hotkeys, interview workflow, modes, and check
 | `Microsoft Visual C++ 14.0 or greater is required` | Do **not** install Build Tools just for this app. Switch to Python 3.11/3.12, or stay on the slim requirements (energy VAD + local RAG). |
 | “Missing API keys” dialog | Place `.env` beside EXE or in `%APPDATA%\Copilot\.env` |
 | No interviewer transcripts | Ensure call audio plays through speakers/headphones; grant mic privacy; try Stereo Mix / WASAPI |
+| `WasapiSettings ... unexpected keyword argument 'loopback'` | Fixed in current tree — pull latest. Then `pip install PyAudioWPatch soundcard` (Windows). sounddevice 0.5.x cannot take `loopback=True`. |
 | OCR empty | Install Tesseract; verify `tesseract --version` in cmd |
 | Overlay appears in screen share | Toggle **Stealth** off/on; requires Windows 10 2004+ |
 | **Overlay vanishes after Stealth ON** | Bug in older builds (Win32 layered alpha + capture exclusion). **Pull latest**, restart. Recovery now: tray icon → **Restore Overlay (if invisible)** or **Toggle Stealth**. Stealth keeps the window visible to you while hiding it from Zoom/Teams/Meet. |

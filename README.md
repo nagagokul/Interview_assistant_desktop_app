@@ -90,7 +90,7 @@ Interview_assistant_desktop_app/
 | UI | PyQt6 frameless dark overlay |
 | STT | Groq Whisper large-v3 |
 | LLM / Vision | Google `gemini-1.5-flash` (`google-genai`) |
-| Capture | sounddevice WASAPI loopback + mss/dxcam |
+| Capture | WASAPI loopback via PyAudioWPatch/soundcard (+ mic via sounddevice) |
 | OCR | Tesseract (bundled or system) |
 | RAG | ChromaDB embedded |
 | Package | PyInstaller one-folder EXE |
