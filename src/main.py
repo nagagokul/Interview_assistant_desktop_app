@@ -1,7 +1,7 @@
 """
 Interview Copilot — application bootstrap.
 
-PyQt6 entrypoint: system tray, global hotkeys, service wiring, overlay window.
+Creates StreamHub AFTER QApplication, wires audio/AI → QueuedConnection → UI.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import traceback
 
 
 def _bootstrap_path() -> None:
-    """Ensure repo root is importable when launched as a script."""
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -26,6 +25,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from src.core.config import CONFIG
 from src.core.logging_setup import get_logger, setup_logging
 from src.core.paths import appdata_dir
+from src.core.stream_hub import StreamHub
 from src.services.ai_orchestrator import AIOrchestrator
 from src.services.audio_service import AudioCaptureService
 from src.services.key_hook_service import KeyHookService
@@ -56,19 +56,39 @@ def main() -> int:
     app.setApplicationName("Interview Copilot")
     app.setOrganizationName("Copilot")
 
+    # StreamHub MUST be created after QApplication
+    hub = StreamHub()
+    print("[UI ROUTE] StreamHub created on GUI thread", flush=True)
+
     missing = CONFIG.validate_keys()
     if missing:
         log.warning("Missing API keys: %s — configure .env before using AI/STT", ", ".join(missing))
 
-    # Core services (in-process memory slots — no local ports)
-    audio = AudioCaptureService()
+    audio = AudioCaptureService(hub=hub)
     ocr = OCRRegionService()
-    ai = AIOrchestrator()
+    ai = AIOrchestrator(hub=hub)
     rag = RAGManager()
     stealth = StealthService()
     hotkeys = KeyHookService()
 
-    dashboard = OverlayDashboard(audio=audio, ocr=ocr, ai=ai, rag=rag, stealth=stealth)
+    # Bridge OCR EventBus → hub so OCR also lands on the GUI thread safely
+    from src.core.event_bus import BUS, Event, EventType
+
+    def _ocr_to_hub(event: Event) -> None:
+        text = event.payload.get("text", "")
+        if text:
+            hub.ocr_text.emit(text)
+
+    BUS.subscribe(EventType.OCR_TEXT, _ocr_to_hub)
+
+    dashboard = OverlayDashboard(
+        audio=audio,
+        ocr=ocr,
+        ai=ai,
+        rag=rag,
+        stealth=stealth,
+        hub=hub,
+    )
 
     tray = SystemTray(dashboard)
     tray.action_show.triggered.connect(dashboard.toggle_visibility)
@@ -97,6 +117,7 @@ def main() -> int:
     hotkeys.start()
 
     dashboard.show()
+    print("[UI ROUTE] Overlay shown — click Listen to start dialogue stream", flush=True)
 
     if missing:
         QMessageBox.information(

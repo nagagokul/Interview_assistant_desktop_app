@@ -71,7 +71,7 @@ class RAGConfig:
 class UIConfig:
     opacity: float = 0.92
     width: int = 420
-    height: int = 640
+    height: int = 740
     always_on_top: bool = True
     stealth_enabled: bool = False  # off by default so the overlay is always visible first
     hotkey_toggle: str = "alt+h"

@@ -228,6 +228,7 @@ class OCRRegionService:
             self._last_text = text
             CTX.set_ocr(text, jpeg)
             BUS.publish(EventType.OCR_TEXT, text=text, change_ratio=diff.change_ratio)
+            print(f"[UI ROUTE] OCR_TEXT chars={len(text)} change={diff.change_ratio:.3f}", flush=True)
             log.info(
                 "OCR %.0fms change=%.3f chars=%d",
                 elapsed_ms,

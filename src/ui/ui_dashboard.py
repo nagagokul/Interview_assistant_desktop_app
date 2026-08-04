@@ -1,21 +1,19 @@
 """
-Frameless stealth overlay dashboard.
+Frameless stealth overlay dashboard — dialogue + AI stream routing.
 
-- Borderless dark window with transparency slider
-- Split interviewer / candidate transcript panels
-- Assistant streaming output
-- Drag-and-drop document ingest for RAG
-- Native WDA_EXCLUDEFROMCAPTURE screen-share exclusion
+Split-view:
+  TOP    — Live Conversation Stream (interviewer left / candidate right)
+  BOTTOM — AI Copilot Core Guidance (QTextBrowser Markdown stream)
+
+All text arrives via StreamHub pyqtSignals with QueuedConnection so worker
+threads never touch Qt widgets directly.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QMouseEvent, QPalette
 from PyQt6.QtWidgets import (
-    QApplication,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -23,7 +21,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSlider,
-    QTabWidget,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -31,70 +29,20 @@ from PyQt6.QtWidgets import (
 
 from src.core.config import CONFIG, save_config
 from src.core.context import CTX
-from src.core.event_bus import BUS, Event, EventType
+from src.core.event_bus import BUS, EventType
 from src.core.logging_setup import get_logger
+from src.core.stream_hub import StreamHub
 from src.data.database import get_db
 from src.services.ai_orchestrator import AIOrchestrator
 from src.services.audio_service import AudioCaptureService
 from src.services.ocr_service import OCRRegionService
 from src.services.rag_service import RAGManager
 from src.services.stealth_service import StealthService
-from src.ui.chat_panel import ChatPanel, SplitTranscriptPanel
+from src.ui.dialogue_widgets import AIGuidanceBrowser, LiveConversationFeed
 from src.ui.snipping_widget import SnippingWidget
 from src.ui.styles import STYLESHEET
 
 log = get_logger("ui")
-
-
-class _AsyncBridge(QThread):
-    """Marshals EventBus callbacks onto the Qt GUI thread via queued signals."""
-
-    transcript = pyqtSignal(str, str)
-    ocr_text = pyqtSignal(str)
-    ai_token = pyqtSignal(str)
-    ai_complete = pyqtSignal(str, float)
-    ai_error = pyqtSignal(str)
-    status = pyqtSignal(str)
-    document_indexed = pyqtSignal(str, int)
-    hotkey = pyqtSignal(str)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._running = True
-
-    def start_bridge(self) -> None:
-        BUS.subscribe(EventType.TRANSCRIPT, self._on_transcript)
-        BUS.subscribe(EventType.OCR_TEXT, self._on_ocr)
-        BUS.subscribe(EventType.AI_TOKEN, self._on_token)
-        BUS.subscribe(EventType.AI_COMPLETE, self._on_complete)
-        BUS.subscribe(EventType.AI_ERROR, self._on_error)
-        BUS.subscribe(EventType.STATUS, self._on_status)
-        BUS.subscribe(EventType.DOCUMENT_INDEXED, self._on_doc)
-        BUS.subscribe(EventType.HOTKEY, self._on_hotkey)
-
-    def _on_transcript(self, event: Event) -> None:
-        self.transcript.emit(event.payload.get("speaker", ""), event.payload.get("text", ""))
-
-    def _on_ocr(self, event: Event) -> None:
-        self.ocr_text.emit(event.payload.get("text", ""))
-
-    def _on_token(self, event: Event) -> None:
-        self.ai_token.emit(event.payload.get("token", ""))
-
-    def _on_complete(self, event: Event) -> None:
-        self.ai_complete.emit(event.payload.get("text", ""), float(event.payload.get("latency_ms", 0)))
-
-    def _on_error(self, event: Event) -> None:
-        self.ai_error.emit(event.payload.get("message", "error"))
-
-    def _on_status(self, event: Event) -> None:
-        self.status.emit(event.payload.get("message", ""))
-
-    def _on_doc(self, event: Event) -> None:
-        self.document_indexed.emit(event.payload.get("filename", ""), int(event.payload.get("chunks", 0)))
-
-    def _on_hotkey(self, event: Event) -> None:
-        self.hotkey.emit(event.payload.get("action", ""))
 
 
 class OverlayDashboard(QWidget):
@@ -105,6 +53,7 @@ class OverlayDashboard(QWidget):
         ai: AIOrchestrator,
         rag: RAGManager,
         stealth: StealthService,
+        hub: StreamHub,
     ) -> None:
         super().__init__(None)
         self.audio = audio
@@ -112,31 +61,19 @@ class OverlayDashboard(QWidget):
         self.ai = ai
         self.rag = rag
         self.stealth = stealth
+        self.hub = hub
 
         self._drag_pos = None
-        self._assistant_buffer = ""
         self._snip = SnippingWidget()
         self._snip.regionSelected.connect(self._on_region_selected)
-
-        self._bridge = _AsyncBridge()
-        self._bridge.start_bridge()
-        self._bridge.transcript.connect(self._ui_transcript)
-        self._bridge.ocr_text.connect(self._ui_ocr)
-        self._bridge.ai_token.connect(self._ui_token)
-        self._bridge.ai_complete.connect(self._ui_complete)
-        self._bridge.ai_error.connect(self._ui_error)
-        self._bridge.status.connect(self._ui_status)
-        self._bridge.document_indexed.connect(self._ui_doc)
-        self._bridge.hotkey.connect(self._ui_hotkey)
+        self._auto_ask_armed = True
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
         self.setWindowTitle("Interview Copilot")
-        self.resize(CONFIG.ui.width, CONFIG.ui.height)
+        self.resize(max(CONFIG.ui.width, 480), max(CONFIG.ui.height, 720))
+
         CTX.opacity = CONFIG.ui.opacity
-        # Prefer visible-first on every cold start. Older builds saved stealth=true
-        # together with Win32 layered alpha, which hid the overlay on some PCs.
-        # Users turn stealth on explicitly from the UI when ready for a call.
         if CONFIG.ui.stealth_enabled:
             log.warning("Resetting saved stealth=true → false for safe startup visibility")
             CONFIG.ui.stealth_enabled = False
@@ -150,14 +87,34 @@ class OverlayDashboard(QWidget):
 
         self.setAcceptDrops(True)
         self._apply_window_flags()
+        self._wire_stream_hub()
 
-        # Apply stealth after the native window handle exists
         QTimer.singleShot(200, self._init_native)
 
-        # Start encrypted history session
         session = get_db().create_session(title="Live Interview")
         CTX.set_session(session.id)
         BUS.publish(EventType.SESSION_STARTED, session_id=session.id)
+        print("[UI TEXT APPENDED] dashboard ready — waiting for streams", flush=True)
+
+    # ---- stream wiring (CRITICAL) ----
+
+    def _wire_stream_hub(self) -> None:
+        """
+        Connect hub signals → GUI slots with QueuedConnection so emits from
+        Whisper/Gemini worker threads are marshalled onto the Qt main thread.
+        """
+        from PyQt6.QtCore import Qt as _Qt
+
+        queued = _Qt.ConnectionType.QueuedConnection
+        self.hub.interviewer_text.connect(self._on_interviewer_text, queued)
+        self.hub.candidate_text.connect(self._on_candidate_text, queued)
+        self.hub.ai_started.connect(self._on_ai_started, queued)
+        self.hub.ai_chunk.connect(self._on_ai_chunk, queued)
+        self.hub.ai_complete.connect(self._on_ai_complete, queued)
+        self.hub.ai_error.connect(self._on_ai_error, queued)
+        self.hub.ocr_text.connect(self._on_ocr_text, queued)
+        self.hub.status.connect(self._on_status, queued)
+        print("[UI ROUTE] StreamHub signals connected (QueuedConnection)", flush=True)
 
     # ---- window chrome ----
 
@@ -168,8 +125,6 @@ class OverlayDashboard(QWidget):
             | Qt.WindowType.Tool
         )
         self.setWindowFlags(flags)
-        # Solid fill — translucent root + Win32 layered alpha + stealth affinity
-        # made the whole overlay disappear on some Windows builds.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAutoFillBackground(True)
         palette = self.palette()
@@ -226,11 +181,17 @@ class OverlayDashboard(QWidget):
         self.btn_stealth.clicked.connect(self.toggle_stealth)
         self.btn_docs = QPushButton("Docs")
         self.btn_docs.clicked.connect(self.pick_documents)
-        ctrl.addWidget(self.btn_listen)
-        ctrl.addWidget(self.btn_snip)
-        ctrl.addWidget(self.btn_ocr)
-        ctrl.addWidget(self.btn_stealth)
-        ctrl.addWidget(self.btn_docs)
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self._clear_feeds)
+        for b in (
+            self.btn_listen,
+            self.btn_snip,
+            self.btn_ocr,
+            self.btn_stealth,
+            self.btn_docs,
+            self.btn_clear,
+        ):
+            ctrl.addWidget(b)
         shell_layout.addLayout(ctrl)
 
         # Opacity
@@ -243,17 +204,36 @@ class OverlayDashboard(QWidget):
         op.addWidget(self.opacity_slider)
         shell_layout.addLayout(op)
 
-        # Tabs
-        self.tabs = QTabWidget()
-        self.split = SplitTranscriptPanel()
-        self.assistant = ChatPanel()
+        # ===== SPLIT VIEW: TOP conversation / BOTTOM AI =====
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+
+        self.conversation = LiveConversationFeed()
+        self.ai_view = AIGuidanceBrowser()
+
+        top_wrap = QWidget()
+        top_l = QVBoxLayout(top_wrap)
+        top_l.setContentsMargins(0, 0, 0, 0)
+        top_l.addWidget(self.conversation)
+
+        bottom_wrap = QWidget()
+        bottom_l = QVBoxLayout(bottom_wrap)
+        bottom_l.setContentsMargins(0, 0, 0, 0)
+        bottom_l.addWidget(self.ai_view)
+
+        splitter.addWidget(top_wrap)
+        splitter.addWidget(bottom_wrap)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([320, 320])
+        shell_layout.addWidget(splitter, 1)
+
+        # OCR peek (compact, does not steal the main split)
         self.ocr_view = QTextEdit()
         self.ocr_view.setReadOnly(True)
-        self.ocr_view.setPlaceholderText("OCR output from selected screen region…")
-        self.tabs.addTab(self.split, "Live")
-        self.tabs.addTab(self.assistant, "Assistant")
-        self.tabs.addTab(self.ocr_view, "OCR")
-        shell_layout.addWidget(self.tabs, 1)
+        self.ocr_view.setMaximumHeight(72)
+        self.ocr_view.setPlaceholderText("OCR region text (optional)…")
+        shell_layout.addWidget(self.ocr_view)
 
         # Ask row
         ask_row = QHBoxLayout()
@@ -270,11 +250,81 @@ class OverlayDashboard(QWidget):
         ask_row.addWidget(self.btn_ask)
         shell_layout.addLayout(ask_row)
 
-        hint = QLabel("Hotkeys: Alt+H hide · Alt+S snip · Alt+Enter ask  |  Drop resume/JD/PDF here")
+        hint = QLabel(
+            "Hotkeys: Alt+H hide · Alt+S snip · Alt+Enter ask  |  "
+            "Blue = Interviewer · Grey = You · Bottom = AI stream"
+        )
         hint.setObjectName("StatusLabel")
         shell_layout.addWidget(hint)
 
         root.addWidget(shell)
+
+    # ---- stream slots (GUI thread only) ----
+
+    @pyqtSlot(str)
+    def _on_interviewer_text(self, text: str) -> None:
+        print(f"[UI TEXT APPENDED] ← interviewer slot text={text[:100]!r}", flush=True)
+        self.conversation.append_interviewer(text)
+        self._persist_transcript("interviewer", text)
+        # Auto-ask on questions
+        if self._auto_ask_armed and text.strip().endswith("?") and not CTX.is_ai_streaming:
+            self.mode.setCurrentText("auto")
+            self.ask_ai()
+
+    @pyqtSlot(str)
+    def _on_candidate_text(self, text: str) -> None:
+        print(f"[UI TEXT APPENDED] ← candidate slot text={text[:100]!r}", flush=True)
+        self.conversation.append_candidate(text)
+        self._persist_transcript("candidate", text)
+
+    @pyqtSlot()
+    def _on_ai_started(self) -> None:
+        print("[UI TEXT APPENDED] ← ai_started", flush=True)
+        self.ai_view.begin_stream()
+        self._on_status("Thinking…")
+
+    @pyqtSlot(str)
+    def _on_ai_chunk(self, chunk: str) -> None:
+        self.ai_view.append_chunk(chunk)
+
+    @pyqtSlot(str, float)
+    def _on_ai_complete(self, text: str, latency_ms: float) -> None:
+        self.ai_view.finalize(text or None)
+        self._on_status(f"Answer ready ({latency_ms:.0f} ms)")
+
+    @pyqtSlot(str)
+    def _on_ai_error(self, message: str) -> None:
+        self.ai_view.show_error(message)
+        self._on_status(message)
+
+    @pyqtSlot(str)
+    def _on_ocr_text(self, text: str) -> None:
+        self.ocr_view.setPlainText(text)
+
+    @pyqtSlot(str)
+    def _on_status(self, message: str) -> None:
+        self.status.setText(message)
+        CTX.set_status(message)
+
+    def _persist_transcript(self, speaker: str, text: str) -> None:
+        if not CTX.session_id:
+            return
+        try:
+            get_db().add_message(
+                CTX.session_id,
+                role="transcript",
+                content=text,
+                speaker=speaker,
+                source="audio",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to persist transcript")
+
+    def _clear_feeds(self) -> None:
+        self.conversation.clear()
+        self.ai_view.begin_stream()
+        self.ai_view.browser.clear()
+        print("[UI TEXT APPENDED] feeds cleared", flush=True)
 
     # ---- interactions ----
 
@@ -300,9 +350,10 @@ class OverlayDashboard(QWidget):
             path = url.toLocalFile()
             if path:
                 try:
-                    self.rag.ingest_file(path)
+                    info = self.rag.ingest_file(path)
+                    self._on_status(f"Indexed {info.get('filename')} ({info.get('chunks')} chunks)")
                 except Exception as exc:  # noqa: BLE001
-                    self._ui_status(f"Ingest failed: {exc}")
+                    self._on_status(f"Ingest failed: {exc}")
                     log.exception("Drop ingest failed")
 
     def toggle_visibility(self) -> None:
@@ -334,7 +385,6 @@ class OverlayDashboard(QWidget):
             self.btn_listen.setText("Stop")
 
     def start_snip(self) -> None:
-        # Temporarily hide overlay so it isn't in the selection
         was_visible = self.isVisible()
         if was_visible:
             self.hide()
@@ -347,10 +397,11 @@ class OverlayDashboard(QWidget):
         if getattr(self, "_snip_restore", True):
             self.show()
             QTimer.singleShot(50, self._reapply_stealth_safe)
-        # Immediate OCR pass
         text = self.ocr.capture_once()
         if text:
             self.ocr_view.setPlainText(text)
+            if self.hub:
+                self.hub.ocr_text.emit(text)
 
     def toggle_ocr(self) -> None:
         if self.ocr.running:
@@ -366,18 +417,16 @@ class OverlayDashboard(QWidget):
         CONFIG.ui.stealth_enabled = enabled
         save_config(CONFIG)
         self._sync_stealth_button()
-        # Always force local visibility after toggling
         self.show()
         self.raise_()
         self.activateWindow()
         if enabled:
-            # Opacity slider is ignored while stealth is on (Win32 alpha conflict)
             self.opacity_slider.setEnabled(False)
-            self._ui_status("Stealth ON — hidden from screen share (still visible to you)")
+            self._on_status("Stealth ON — hidden from screen share (still visible to you)")
         else:
             self.opacity_slider.setEnabled(True)
             self.setWindowOpacity(CTX.opacity)
-            self._ui_status("Stealth OFF — visible in screen share")
+            self._on_status("Stealth OFF — visible in screen share")
 
     def _sync_stealth_button(self) -> None:
         on = CTX.stealth_enabled
@@ -386,7 +435,6 @@ class OverlayDashboard(QWidget):
             self.opacity_slider.setEnabled(not on)
 
     def restore_overlay(self) -> None:
-        """Tray / recovery: show overlay and turn stealth off if needed."""
         self.stealth.reveal(self)
         CONFIG.ui.stealth_enabled = False
         save_config(CONFIG)
@@ -395,7 +443,7 @@ class OverlayDashboard(QWidget):
         self.raise_()
         self.activateWindow()
         CTX.overlay_visible = True
-        self._ui_status("Overlay restored (Stealth OFF)")
+        self._on_status("Overlay restored (Stealth OFF)")
 
     def pick_documents(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -406,88 +454,43 @@ class OverlayDashboard(QWidget):
         )
         for f in files:
             try:
-                self.rag.ingest_file(f)
+                info = self.rag.ingest_file(f)
+                self._on_status(f"Indexed {info.get('filename')} ({info.get('chunks')} chunks)")
             except Exception as exc:  # noqa: BLE001
-                self._ui_status(f"Ingest failed: {exc}")
+                self._on_status(f"Ingest failed: {exc}")
 
     def ask_ai(self) -> None:
         hint = self.input.text().strip()
         mode = self.mode.currentText()
-        self._assistant_buffer = ""
-        self.assistant.add_message("assistant", "…", mono=True)
-        self.tabs.setCurrentWidget(self.assistant)
-        # Refresh RAG with latest conversational context
         try:
             self.rag.refresh_context_from_latest()
         except Exception:  # noqa: BLE001
             log.exception("RAG refresh failed")
-        self.ai.ask(user_hint=hint, mode=mode, include_image=True, persist=True)
-        if hint:
-            get_db().add_message(CTX.session_id or "", role="user", content=hint, source="manual")
+
+        rolling = getattr(self.audio, "rolling_context", "") or CTX.transcript_block(40)
+        print(f"[GEMINI STREAM START] ask_ai mode={mode} rolling_chars={len(rolling)}", flush=True)
+        self.ai.ask(
+            user_hint=hint,
+            mode=mode,
+            include_image=True,
+            persist=True,
+            rolling_context=rolling,
+        )
+        if hint and CTX.session_id:
+            get_db().add_message(CTX.session_id, role="user", content=hint, source="manual")
         self.input.clear()
 
     def _on_opacity(self, value: int) -> None:
         opacity = value / 100.0
         self.stealth.set_opacity(opacity)
         CONFIG.ui.opacity = opacity
-        # Debounced save
         if not hasattr(self, "_opacity_timer"):
             self._opacity_timer = QTimer(self)
             self._opacity_timer.setSingleShot(True)
             self._opacity_timer.timeout.connect(lambda: save_config(CONFIG))
         self._opacity_timer.start(500)
 
-    # ---- EventBus → UI slots ----
-
-    @pyqtSlot(str, str)
-    def _ui_transcript(self, speaker: str, text: str) -> None:
-        self.split.add_transcript(speaker, text)
-        if CTX.session_id:
-            get_db().add_message(
-                CTX.session_id,
-                role="transcript",
-                content=text,
-                speaker=speaker,
-                source="audio",
-            )
-        # Auto-ask on interviewer questions ending with '?'
-        if speaker == "interviewer" and text.strip().endswith("?"):
-            if not CTX.is_ai_streaming:
-                self.mode.setCurrentText("auto")
-                self.ask_ai()
-
-    @pyqtSlot(str)
-    def _ui_ocr(self, text: str) -> None:
-        self.ocr_view.setPlainText(text)
-
-    @pyqtSlot(str)
-    def _ui_token(self, token: str) -> None:
-        self._assistant_buffer += token
-        self.assistant.update_last_assistant(self._assistant_buffer)
-        # Keep under 30ms perceived latency — Qt paints on next event loop tick
-
-    @pyqtSlot(str, float)
-    def _ui_complete(self, text: str, latency_ms: float) -> None:
-        if text:
-            self.assistant.update_last_assistant(text)
-        self._ui_status(f"Answer ready ({latency_ms:.0f} ms)")
-
-    @pyqtSlot(str)
-    def _ui_error(self, message: str) -> None:
-        self.assistant.add_message("assistant", f"Error: {message}")
-        self._ui_status(message)
-
-    @pyqtSlot(str)
-    def _ui_status(self, message: str) -> None:
-        self.status.setText(message)
-        CTX.set_status(message)
-
-    @pyqtSlot(str, int)
-    def _ui_doc(self, filename: str, chunks: int) -> None:
-        self._ui_status(f"Indexed {filename} ({chunks} chunks)")
-
-    @pyqtSlot(str)
-    def _ui_hotkey(self, action: str) -> None:
+    def handle_hotkey(self, action: str) -> None:
         if action == "toggle_overlay":
             self.toggle_visibility()
         elif action == "snip_region":

@@ -1,16 +1,15 @@
 """
-AIEngineService / AI Orchestrator
+AIOrchestrator — Gemini 1.5 Flash streaming into StreamHub.ai_chunk signals.
 
 Stitches system instructions, resume/RAG buffers, live transcripts, OCR text,
-and optional region images into Gemini 1.5 Flash streaming prompts.
+and optional region images. Worker-thread stream → QueuedConnection → GUI.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
-from typing import Any, Generator, Iterable
+from typing import TYPE_CHECKING, Any, Generator
 
 from src.core.config import CONFIG
 from src.core.context import CTX
@@ -18,6 +17,9 @@ from src.core.event_bus import BUS, EventType
 from src.core.logging_setup import get_logger
 from src.core.paths import prompts_dir
 from src.data.database import get_db
+
+if TYPE_CHECKING:
+    from src.core.stream_hub import StreamHub
 
 log = get_logger("ai")
 
@@ -47,7 +49,6 @@ def _load_system_prompt() -> str:
     path = prompts_dir() / CONFIG.ai.system_prompt_file
     if path.is_file():
         return path.read_text(encoding="utf-8")
-    # Ensure assets exist for packaging
     try:
         prompts_dir().mkdir(parents=True, exist_ok=True)
         path.write_text(DEFAULT_SYSTEM_PROMPT, encoding="utf-8")
@@ -59,12 +60,21 @@ def _load_system_prompt() -> str:
 class AIOrchestrator:
     """Gemini streaming orchestrator with multimodal (text + image) support."""
 
-    def __init__(self) -> None:
+    def __init__(self, hub: StreamHub | None = None) -> None:
         self.config = CONFIG.ai
+        self.hub = hub
         self._client: Any = None
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
+        self._extra_context: str = ""
+
+    def set_hub(self, hub: StreamHub) -> None:
+        self.hub = hub
+
+    def set_rolling_context(self, context: str) -> None:
+        """Inject audio service rolling transcript string into the next prompt."""
+        self._extra_context = context or ""
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -73,7 +83,6 @@ class AIOrchestrator:
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY / GEMINI_API_KEY is not configured")
 
-        # Prefer official google-genai SDK; fall back to google-generativeai
         try:
             from google import genai
 
@@ -100,12 +109,9 @@ class AIOrchestrator:
         include_image: bool = True,
         mode: str = "auto",
     ) -> tuple[str, bytes | None]:
-        """
-        Assemble context-rich prompt from shared AppContext memory slots.
-
-        Returns (text_prompt, optional_jpeg_bytes).
-        """
         transcript = CTX.transcript_block(40)
+        if self._extra_context:
+            transcript = (transcript + "\n" + self._extra_context).strip()
         ocr_text = CTX.latest_ocr_text
         rag = CTX.rag_context
         resume = CTX.resume_summary
@@ -148,8 +154,11 @@ class AIOrchestrator:
         mode: str = "auto",
         include_image: bool = True,
         persist: bool = True,
+        rolling_context: str = "",
     ) -> None:
         """Fire-and-forget streaming ask on a worker thread (keeps UI fluid)."""
+        if rolling_context:
+            self._extra_context = rolling_context
         if self._thread and self._thread.is_alive():
             self.cancel()
             self._thread.join(timeout=1.0)
@@ -181,20 +190,37 @@ class AIOrchestrator:
         CTX.is_ai_streaming = True
         CTX.add_chat("assistant", "", streaming=True)
         BUS.publish(EventType.STATUS, message="Thinking…")
+        if self.hub:
+            self.hub.ai_started.emit()
+            self.hub.emit_status("Thinking…")
+        print("[GEMINI STREAM START] mode=%s hint=%r" % (mode, user_hint[:80]), flush=True)
+
         t0 = time.perf_counter()
         full: list[str] = []
         try:
             prompt, image = self.build_prompt(user_hint, include_image, mode)
+            print(f"[GEMINI STREAM START] prompt_chars={len(prompt)} has_image={image is not None}", flush=True)
+
             for token in self._stream_tokens(prompt, image):
                 if self._cancel.is_set():
+                    print("[GEMINI STREAM START] cancelled", flush=True)
                     break
                 full.append(token)
                 CTX.append_assistant_token(token)
+                # Thread-safe Qt signal (primary)
+                if self.hub:
+                    self.hub.emit_ai_chunk(token)
                 BUS.publish(EventType.AI_TOKEN, token=token)
+
             CTX.finalize_assistant()
             answer = "".join(full).strip()
             elapsed_ms = (time.perf_counter() - t0) * 1000
             log.info("Gemini stream complete %.0fms (%d chars)", elapsed_ms, len(answer))
+            print(f"[GEMINI STREAM START] complete chars={len(answer)} latency_ms={elapsed_ms:.0f}", flush=True)
+
+            if self.hub:
+                self.hub.ai_complete.emit(answer, elapsed_ms)
+                self.hub.emit_status(f"Answer ready ({elapsed_ms:.0f} ms)")
             BUS.publish(EventType.AI_COMPLETE, text=answer, latency_ms=elapsed_ms)
             BUS.publish(EventType.STATUS, message=f"Answer ready ({elapsed_ms:.0f} ms)")
 
@@ -218,7 +244,11 @@ class AIOrchestrator:
                     log.exception("Failed to persist AI message")
         except Exception as exc:  # noqa: BLE001
             log.exception("AI orchestration failed")
+            print(f"[GEMINI STREAM START] ERROR {exc}", flush=True)
             CTX.finalize_assistant()
+            if self.hub:
+                self.hub.ai_error.emit(str(exc))
+                self.hub.emit_status(f"AI error: {exc}")
             BUS.publish(EventType.AI_ERROR, message=str(exc))
             BUS.publish(EventType.STATUS, message=f"AI error: {exc}")
         finally:
@@ -242,20 +272,19 @@ class AIOrchestrator:
                 0,
                 types.Part.from_bytes(data=image_jpeg, mime_type="image/jpeg"),
             )
-        contents = [
-            types.Content(role="user", parts=parts),
-        ]
+        contents = [types.Content(role="user", parts=parts)]
         config = types.GenerateContentConfig(
             system_instruction=_load_system_prompt(),
             temperature=self.config.temperature,
             max_output_tokens=self.config.max_output_tokens,
         )
-        stream = client.models.generate_content_stream(
+        # Official google-genai streaming loop
+        response = client.models.generate_content_stream(
             model=self.config.gemini_model,
             contents=contents,
             config=config,
         )
-        for chunk in stream:
+        for chunk in response:
             if self._cancel.is_set():
                 break
             text = getattr(chunk, "text", None)
@@ -290,6 +319,5 @@ class AIOrchestrator:
                 yield text
 
     def ask_sync(self, user_hint: str = "", mode: str = "auto") -> str:
-        """Blocking helper for tests / CLI."""
         prompt, image = self.build_prompt(user_hint, True, mode)
         return "".join(self._stream_tokens(prompt, image))
