@@ -160,18 +160,27 @@ class AIGuidanceBrowser(QWidget):
 
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(False)
-        self.browser.setFont(QFont("Segoe UI", 11))
+        self.browser.setFont(QFont("Consolas", 11))
+        self.browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.browser.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.browser.setMinimumHeight(280)
         self.browser.setStyleSheet(
             "QTextBrowser {"
             " background-color: #0B1018;"
             " color: #E8ECF1;"
             " border: 1px solid #2A3548;"
             " border-radius: 6px;"
-            " padding: 8px;"
+            " padding: 10px;"
+            " selection-background-color: #2A4A6A;"
             "}"
         )
-        self.browser.setPlaceholderText("AI answers, code, complexity, and follow-ups stream here…")
+        self.browser.setPlaceholderText(
+            "AI answers, code, complexity, and follow-ups stream here…"
+        )
         root.addWidget(self.browser, 1)
+        self.setMinimumHeight(320)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         bar = self.browser.verticalScrollBar()
         bar.valueChanged.connect(self._on_scroll)
