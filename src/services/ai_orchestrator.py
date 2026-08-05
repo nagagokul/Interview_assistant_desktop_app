@@ -2,17 +2,36 @@
 AIOrchestrator — rolling conversation memory + Gemini Flash streaming.
 
 - Thread-safe chronological transcript state tagged [INTERVIEWER]/[CANDIDATE]
-- Auto-triggers on interviewer turns (commands/questions — not only '?')
+- Auto-triggers on interviewer turns (?, pause ≥1.5s after substantive ask)
+- Local intent classifier auto-switches coding / technical_discussion / behavioral
 - Streams tokens via StreamHub / pyqtSignals only (never touches widgets)
 """
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Deque, Generator
+
+try:
+    from PyQt6.QtCore import QObject, pyqtSignal
+except ImportError:  # headless / unit-test environments without PyQt6 wheels
+    class QObject:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    class _DummySignal:
+        def emit(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def connect(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    def pyqtSignal(*_a: Any, **_k: Any) -> _DummySignal:  # type: ignore[misc]
+        return _DummySignal()
 
 from src.core.config import CONFIG, GEMINI_MODEL_FALLBACKS, normalize_gemini_model
 from src.core.context import CTX
@@ -26,7 +45,9 @@ if TYPE_CHECKING:
 
 log = get_logger("ai")
 
-DEFAULT_SYSTEM_PROMPT = """You are Interview Copilot — an elite, discreet technical interview assistant.
+DEFAULT_SYSTEM_PROMPT = """SYSTEM_INSTRUCTION: You are an elite silent technical copilot. Ignore casual banter if a technical question has been asked. If the transcript contains a programming request, immediately stop conversational chatting and output the optimized code, complexity analysis, and implementation hints in clean Markdown.
+
+You are Interview Copilot — an elite, discreet technical interview assistant.
 
 Mission: Deliver nearly instant, high-signal help during coding interviews, system design,
 debugging, and behavioral (STAR) conversations.
@@ -34,8 +55,8 @@ debugging, and behavioral (STAR) conversations.
 Rules:
 1. Be concise. Prefer short, interview-ready answers over essays.
 2. Match the language the interviewer is using (C, C++, Python, Java, SQL, Bash, etc.).
-3. For coding: provide correct, optimized solutions with time/space complexity.
-4. For system design: give clear components, trade-offs, and a crisp diagram in ASCII/Markdown.
+3. For coding: provide correct, optimized solutions with time/space complexity in Markdown fences.
+4. For system design / technical discussion: give clear components, trade-offs, and a crisp diagram in ASCII/Markdown.
 5. For behavioral: use STAR grounded in the candidate's resume only.
 6. Generate likely follow-up questions the interviewer may ask next.
 7. Never invent resume facts — use only provided resume/RAG context.
@@ -44,14 +65,87 @@ Rules:
    - Answer
    - Complexity (if coding)
    - Follow-ups
-10. The latest [INTERVIEWER] turn is the primary request to answer NOW.
+10. The latest substantive [INTERVIEWER] turn is the primary request to answer NOW.
+    Never answer mic checks / "are you there?" once a real technical ask exists in the transcript.
 """
+
+UI_MODES = ("auto", "coding", "technical_discussion", "behavioral", "debug")
+
+_CODING_KEYWORDS = (
+    r"write\s+code",
+    r"write\s+the\s+code",
+    r"implement",
+    r"\bc\+\+\b",
+    r"\bpython\b",
+    r"\bjava\b",
+    r"\bleetcode\b",
+    r"linked\s*list",
+    r"\barray\b",
+    r"\bfunction\b",
+    r"\balgorithm\b",
+    r"\bcode\b",
+    r"insert\s+(a\s+)?node",
+    r"binary\s+tree",
+    r"\bpointer\b",
+    r"\bstack\b",
+    r"\bqueue\b",
+    r"\bgraph\b",
+    r"time\s+complexity",
+    r"\bsort\b",
+    r"\bdebug\b",
+    r"\boptimize\b",
+)
+
+_TECH_DISCUSSION_KEYWORDS = (
+    r"system\s+design",
+    r"database\s+scalability",
+    r"\bmicroservices?\b",
+    r"\blatency\b",
+    r"load\s+balancer",
+    r"\bcache\b",
+    r"\bcaching\b",
+    r"\bsharding\b",
+    r"\bscalability\b",
+    r"\bthroughput\b",
+    r"\bcdn\b",
+    r"\breplication\b",
+    r"\bconsistency\b",
+    r"\barchitecture\b",
+    r"design\s+a\s+(system|service|api)",
+)
+
+_BEHAVIORAL_KEYWORDS = (
+    r"tell\s+me\s+about\s+a\s+time",
+    r"\bconflict\b",
+    r"\bweakness(es)?\b",
+    r"\bleadership\b",
+    r"project\s+experience",
+    r"\bstar\s+method\b",
+    r"tell\s+me\s+about\s+yourself",
+    r"greatest\s+strength",
+    r"work\s+with\s+(a\s+)?team",
+    r"difficult\s+(coworker|situation|stakeholder)",
+)
+
+_CODING_RE = re.compile("|".join(_CODING_KEYWORDS), re.IGNORECASE)
+_TECH_RE = re.compile("|".join(_TECH_DISCUSSION_KEYWORDS), re.IGNORECASE)
+_BEHAVIORAL_RE = re.compile("|".join(_BEHAVIORAL_KEYWORDS), re.IGNORECASE)
 
 
 def _load_system_prompt() -> str:
     path = prompts_dir() / CONFIG.ai.system_prompt_file
     if path.is_file():
-        return path.read_text(encoding="utf-8")
+        body = path.read_text(encoding="utf-8")
+        if "SYSTEM_INSTRUCTION:" not in body:
+            return (
+                "SYSTEM_INSTRUCTION: You are an elite silent technical copilot. "
+                "Ignore casual banter if a technical question has been asked. "
+                "If the transcript contains a programming request, immediately stop "
+                "conversational chatting and output the optimized code, complexity "
+                "analysis, and implementation hints in clean Markdown.\n\n"
+                + body
+            )
+        return body
     try:
         prompts_dir().mkdir(parents=True, exist_ok=True)
         path.write_text(DEFAULT_SYSTEM_PROMPT, encoding="utf-8")
@@ -64,12 +158,37 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
+def classify_intent(text: str) -> str:
+    """Fast local intent → coding | technical_discussion | behavioral | auto."""
+    blob = (text or "").strip()
+    if not blob:
+        return "auto"
+    if _CODING_RE.search(blob):
+        return "coding"
+    if _TECH_RE.search(blob):
+        return "technical_discussion"
+    if _BEHAVIORAL_RE.search(blob):
+        return "behavioral"
+    return "auto"
+
+
+def prompt_mode_for(ui_mode: str) -> str:
+    """Map UI combo values onto prompt instruction keys."""
+    m = (ui_mode or "auto").strip().lower()
+    if m in ("technical_discussion", "system_design"):
+        return "system_design"
+    if m in ("coding", "behavioral", "debug", "auto"):
+        return m
+    return "auto"
+
+
 class ConversationMemory:
-    """Thread-safe rolling transcript of tagged turns."""
+    """Thread-safe rolling transcript + interviewer sliding window."""
 
     def __init__(self, maxlen: int = 40) -> None:
         self._lock = threading.RLock()
         self._turns: Deque[str] = deque(maxlen=maxlen)
+        self._interviewer: Deque[str] = deque(maxlen=12)
 
     def append(self, tag: str, text: str) -> str:
         text = (text or "").strip()
@@ -78,6 +197,8 @@ class ConversationMemory:
         line = f"{_stamp()} - {tag}: {text}"
         with self._lock:
             self._turns.append(line)
+            if tag == "[INTERVIEWER]":
+                self._interviewer.append(text)
         print(f"[CONTEXT] append {line[:160]}", flush=True)
         return line
 
@@ -86,6 +207,19 @@ class ConversationMemory:
             items = list(self._turns)[-n:]
         return "\n".join(items)
 
+    def interviewer_window(self, n: int = 3) -> str:
+        with self._lock:
+            items = list(self._interviewer)[-n:]
+        return "\n".join(items)
+
+    def latest_substantive_interviewer(self) -> str:
+        with self._lock:
+            items = list(self._interviewer)
+        for text in reversed(items):
+            if not looks_like_chitchat(text):
+                return text
+        return items[-1] if items else ""
+
     def all_text(self) -> str:
         with self._lock:
             return "\n".join(self._turns)
@@ -93,41 +227,17 @@ class ConversationMemory:
     def clear(self) -> None:
         with self._lock:
             self._turns.clear()
+            self._interviewer.clear()
 
 
 def looks_like_technical_prompt(text: str) -> bool:
-    lower = (text or "").lower()
-    tech = (
-        "write ",
-        "implement",
-        "code",
-        "c++",
-        "python",
-        "java",
-        "leetcode",
-        "algorithm",
-        "linked list",
-        "binary tree",
-        "complexity",
-        "insert ",
-        "design ",
-        "sql",
-        "class ",
-        "function",
-        "recurse",
-        "pointer",
-        "array",
-        "stack",
-        "queue",
-        "graph",
-        "sort",
-        "debug",
-        "optimize",
-        "api",
-        "database",
-        "system design",
+    return classify_intent(text) in ("coding", "technical_discussion") or bool(
+        re.search(
+            r"write |implement|\bcode\b|c\+\+|python|java|leetcode|algorithm|"
+            r"linked list|insert |design |sql|function|optimize|debug",
+            (text or "").lower(),
+        )
     )
-    return any(k in lower for k in tech)
 
 
 def looks_like_chitchat(text: str) -> bool:
@@ -135,8 +245,7 @@ def looks_like_chitchat(text: str) -> bool:
     t = " ".join((text or "").strip().lower().split())
     if not t:
         return True
-    # Short greetings / mic checks
-    if len(t) < 48 and any(
+    if len(t) < 56 and any(
         p in t
         for p in (
             "hello",
@@ -163,7 +272,6 @@ def looks_like_chitchat(text: str) -> bool:
             "you got me",
         )
     ):
-        # Still allow if it also looks like a real technical ask
         if looks_like_technical_prompt(t):
             return False
         return True
@@ -178,10 +286,8 @@ def looks_like_interviewer_prompt(text: str) -> bool:
     if looks_like_chitchat(t):
         return False
     lower = t.lower()
-    # Explicit question
     if "?" in t:
         return True
-    # Imperative / coding prompts
     triggers = (
         "write ",
         "implement",
@@ -211,10 +317,13 @@ def looks_like_interviewer_prompt(text: str) -> bool:
     return any(k in lower for k in triggers)
 
 
-class AIOrchestrator:
+class AIOrchestrator(QObject):
     """Gemini streaming orchestrator with conversation memory + auto trigger."""
 
-    def __init__(self, hub: StreamHub | None = None) -> None:
+    mode_changed_signal = pyqtSignal(str)
+
+    def __init__(self, hub: StreamHub | None = None, parent: QObject | None = None) -> None:
+        super().__init__(parent)
         self.config = CONFIG.ai
         self.hub = hub
         self.memory = ConversationMemory(maxlen=40)
@@ -226,8 +335,9 @@ class AIOrchestrator:
         self._debounce_timer: threading.Timer | None = None
         self._on_error: Callable[[str], None] | None = None
         self._mode_provider: Callable[[], str] | None = None
-        self._generation = 0  # monotonic; stale streams must not update UI
+        self._generation = 0
         self._pending_auto_text: str = ""
+        self._active_mode: str = "auto"
 
     def set_hub(self, hub: StreamHub) -> None:
         self.hub = hub
@@ -247,13 +357,35 @@ class AIOrchestrator:
                     return mode
             except Exception:  # noqa: BLE001
                 pass
-        return "auto"
+        return self._active_mode or "auto"
+
+    def _apply_classified_mode(self, classified: str) -> str:
+        """Update active mode + notify UI dropdown when intent is non-auto."""
+        if classified and classified != "auto":
+            if classified != self._active_mode:
+                print(f"[INTENT] mode → {classified}", flush=True)
+            self._active_mode = classified
+            try:
+                self.mode_changed_signal.emit(classified)
+            except Exception:  # noqa: BLE001
+                log.exception("mode_changed_signal emit failed")
+            return classified
+        if self._active_mode in ("coding", "technical_discussion", "behavioral"):
+            return self._active_mode
+        return self._current_mode()
 
     def record_interviewer(self, text: str, auto_ask: bool = True) -> None:
         self.memory.append("[INTERVIEWER]", text)
         CTX.add_transcript("interviewer", text)
+
+        window = self.memory.interviewer_window(3)
+        classified = classify_intent(window) if window else classify_intent(text)
+        if classified == "auto":
+            classified = classify_intent(text)
+        mode = self._apply_classified_mode(classified)
+
         if auto_ask and self._auto_enabled and looks_like_interviewer_prompt(text):
-            self._schedule_auto_ask(text)
+            self._schedule_auto_ask(text, mode=mode)
         elif auto_ask and looks_like_chitchat(text):
             print(
                 f"[GEMINI STREAM START] skip chitchat/audio-check: {text[:80]!r}",
@@ -264,41 +396,47 @@ class AIOrchestrator:
         self.memory.append("[CANDIDATE]", text)
         CTX.add_transcript("candidate", text)
 
-    def _schedule_auto_ask(self, latest: str) -> None:
+    def _schedule_auto_ask(self, latest: str, mode: str | None = None) -> None:
         """
-        Debounce rapid chunks, then answer the LATEST interviewer prompt.
-
-        CRITICAL: never drop a new prompt just because Gemini is still streaming
-        the previous (often trivial) turn — cancel + restart instead.
+        Buffer interviewer words; fire on '?' quickly or after ≥1.5s pause.
+        Never drop a newer prompt while a prior stream is still running.
         """
         self._pending_auto_text = latest
+        pending_mode = mode or self._active_mode or "auto"
         if self._debounce_timer is not None:
             self._debounce_timer.cancel()
 
+        delay = 0.45 if "?" in latest else 1.5
+
         def _fire() -> None:
             text = self._pending_auto_text
-            mode = self._current_mode()
-            # Prefer coding mode when the utterance is clearly technical
-            if mode == "auto" and looks_like_technical_prompt(text):
-                mode = "coding"
+            window = self.memory.interviewer_window(3)
+            classified = classify_intent(window) if window else classify_intent(text)
+            if classified == "auto":
+                classified = classify_intent(text)
+            resolved = self._apply_classified_mode(classified)
+            if resolved == "auto":
+                resolved = pending_mode if pending_mode != "auto" else self._current_mode()
+            primary = self.memory.latest_substantive_interviewer() or text
             print(
-                f"[GEMINI STREAM START] AUTO trigger from interviewer "
-                f"(mode={mode}, streaming={CTX.is_ai_streaming}): {text[:100]!r}",
+                f"[GEMINI STREAM START] AUTO trigger "
+                f"(mode={resolved}, delay={delay}, streaming={CTX.is_ai_streaming}): "
+                f"{primary[:100]!r}",
                 flush=True,
             )
             self.ask(
                 user_hint=(
-                    "Answer the LATEST [INTERVIEWER] request now. "
-                    "Ignore prior audio checks / greetings. "
-                    f"Primary request: {text}"
+                    "SYSTEM_INSTRUCTION override: Ignore casual banter. "
+                    "Answer the LATEST substantive [INTERVIEWER] request now with "
+                    "optimized code / architecture / STAR as appropriate. "
+                    f"Primary request: {primary}"
                 ),
-                mode=mode,
+                mode=resolved,
                 include_image=True,
                 persist=True,
             )
 
-        # Longer debounce so multi-utterance questions coalesce before Gemini fires
-        self._debounce_timer = threading.Timer(1.1, _fire)
+        self._debounce_timer = threading.Timer(delay, _fire)
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
 
@@ -345,13 +483,20 @@ class AIOrchestrator:
         resume = CTX.resume_summary
         jd = CTX.job_description
 
+        key = prompt_mode_for(mode)
         mode_instruction = {
-            "auto": "Infer the best response style from context.",
-            "coding": "Focus on correct optimized code, edge cases, and complexity.",
-            "system_design": "Focus on architecture, scalability, and trade-offs.",
-            "behavioral": "Coach a STAR answer grounded in the resume.",
-            "debug": "Diagnose the bug from OCR/code and propose a fix.",
-        }.get(mode, "Infer the best response style from context.")
+            "auto": "Infer the best response style from context — prefer code if a programming ask is present.",
+            "coding": (
+                "CODING MODE: Immediately output optimized code in Markdown fences, "
+                "then complexity and brief implementation hints. No conversational filler."
+            ),
+            "system_design": (
+                "TECHNICAL DISCUSSION MODE: Architecture, scalability, trade-offs, "
+                "and a crisp ASCII/Markdown diagram. No mic-check small talk."
+            ),
+            "behavioral": "BEHAVIORAL MODE: Coach a STAR answer grounded in the resume only.",
+            "debug": "DEBUG MODE: Diagnose the bug from OCR/code and propose a fix.",
+        }.get(key, "Infer the best response style from context.")
 
         parts = [
             f"## Mode\n{mode_instruction}",
@@ -359,7 +504,7 @@ class AIOrchestrator:
             "Tags are authoritative. [INTERVIEWER] = question/request. "
             "[CANDIDATE] = what the user already said.\n"
             "IMPORTANT: Answer ONLY the most recent substantive [INTERVIEWER] ask. "
-            "Ignore earlier mic checks / greetings if a later coding or technical question exists.\n"
+            "Ignore earlier mic checks / greetings if a later coding or technical question exists.\nIf ANY programming request appears in the window, answer THAT — not prior banter.\n"
             f"{history}",
         ]
         if ocr_text:

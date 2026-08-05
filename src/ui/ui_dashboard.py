@@ -73,7 +73,7 @@ class OverlayDashboard(QWidget):
         self.ai.set_mode_provider(lambda: self.mode.currentText())
         self.setStyleSheet(STYLESHEET)
         self.setWindowTitle("Interview Copilot")
-        self.resize(max(CONFIG.ui.width, 480), max(CONFIG.ui.height, 720))
+        self.resize(max(CONFIG.ui.width, 520), max(CONFIG.ui.height, 900))
 
         CTX.opacity = CONFIG.ui.opacity
         if CONFIG.ui.stealth_enabled:
@@ -116,6 +116,8 @@ class OverlayDashboard(QWidget):
         self.hub.ai_error.connect(self._on_ai_error, queued)
         self.hub.ocr_text.connect(self._on_ocr_text, queued)
         self.hub.status.connect(self._on_status, queued)
+        # Intent classifier → dropdown (may emit from worker/timer thread)
+        self.ai.mode_changed_signal.connect(self._on_mode_changed, queued)
         print("[UI ROUTE] StreamHub signals connected (QueuedConnection)", flush=True)
 
     # ---- window chrome ----
@@ -206,12 +208,17 @@ class OverlayDashboard(QWidget):
         op.addWidget(self.opacity_slider)
         shell_layout.addLayout(op)
 
-        # ===== SPLIT VIEW: TOP conversation / BOTTOM AI =====
+        # ===== SPLIT VIEW: TOP conversation (30%) / BOTTOM AI (70%) =====
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
+        self._main_splitter = splitter
 
         self.conversation = LiveConversationFeed()
+        self.conversation.setMinimumHeight(120)
+        self.conversation.setMaximumHeight(280)
+
         self.ai_view = AIGuidanceBrowser()
+        self.ai_view.setMinimumHeight(450)
 
         top_wrap = QWidget()
         top_l = QVBoxLayout(top_wrap)
@@ -225,22 +232,23 @@ class OverlayDashboard(QWidget):
 
         splitter.addWidget(top_wrap)
         splitter.addWidget(bottom_wrap)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 320])
+        # Favor AI guidance viewport for dense Markdown / C++ answers
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        splitter.setSizes([220, 520])
         shell_layout.addWidget(splitter, 1)
 
         # OCR peek (compact)
         self.ocr_view = QTextEdit()
         self.ocr_view.setReadOnly(True)
-        self.ocr_view.setMaximumHeight(56)
+        self.ocr_view.setMaximumHeight(48)
         self.ocr_view.setPlaceholderText("OCR region text (optional)…")
         shell_layout.addWidget(self.ocr_view)
 
         # Pipeline / API diagnostic log (shows Groq/Gemini failures in-UI)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(64)
+        self.log_view.setMaximumHeight(56)
         self.log_view.setPlaceholderText("Pipeline log — API errors and diarization notes appear here…")
         self.log_view.setStyleSheet(
             "QTextEdit{background:#140E0E;color:#FFB4B4;border:1px solid #4A3030;"
@@ -248,10 +256,15 @@ class OverlayDashboard(QWidget):
         )
         shell_layout.addWidget(self.log_view)
 
-        # Ask row
+        # Ask row — mode auto-updates from intent classifier
         ask_row = QHBoxLayout()
         self.mode = QComboBox()
-        self.mode.addItems(["auto", "coding", "system_design", "behavioral", "debug"])
+        self.mode.addItems(
+            ["auto", "coding", "technical_discussion", "behavioral", "debug"]
+        )
+        self.mode.setToolTip(
+            "Auto-switches from interviewer speech (coding / technical discussion / behavioral)"
+        )
         self.input = QLineEdit()
         self.input.setPlaceholderText("Hint or question… (Alt+Enter)")
         self.input.returnPressed.connect(self.ask_ai)
@@ -266,7 +279,7 @@ class OverlayDashboard(QWidget):
         hint = QLabel(
             "Hotkeys: Alt+H hide · Alt+S snip · Alt+Enter ask  |  "
             "Blue = Interviewer · Grey = You · Bottom = AI  |  "
-            "AI auto-runs on interviewer prompts (echo-filtered)"
+            "Mode auto-switches from speech · AI re-asks on new interviewer prompts"
         )
         hint.setObjectName("StatusLabel")
         shell_layout.addWidget(hint)
@@ -274,6 +287,25 @@ class OverlayDashboard(QWidget):
         root.addWidget(shell)
 
     # ---- stream slots (GUI thread only) ----
+
+    @pyqtSlot(str)
+    def _on_mode_changed(self, mode: str) -> None:
+        """Sync Ask-mode dropdown when intent classifier fires."""
+        mode = (mode or "").strip()
+        if not mode or not hasattr(self, "mode"):
+            return
+        idx = self.mode.findText(mode)
+        if idx < 0 and mode == "system_design":
+            idx = self.mode.findText("technical_discussion")
+            mode = "technical_discussion"
+        if idx < 0:
+            return
+        if self.mode.currentIndex() != idx:
+            self.mode.blockSignals(True)
+            self.mode.setCurrentIndex(idx)
+            self.mode.blockSignals(False)
+            self._append_log(f"MODE auto → {mode}")
+            print(f"[UI ROUTE] mode dropdown → {mode}", flush=True)
 
     @pyqtSlot(str)
     def _on_interviewer_text(self, text: str) -> None:
@@ -508,6 +540,18 @@ class OverlayDashboard(QWidget):
     def ask_ai(self) -> None:
         hint = self.input.text().strip()
         mode = self.mode.currentText()
+        # Manual Ask still runs local intent on transcript window if mode is auto
+        if mode == "auto":
+            try:
+                from src.services.ai_orchestrator import classify_intent
+
+                window = self.ai.memory.interviewer_window(3)
+                classified = classify_intent(window or hint)
+                if classified != "auto":
+                    mode = classified
+                    self._on_mode_changed(mode)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self.rag.refresh_context_from_latest()
         except Exception:  # noqa: BLE001
@@ -516,7 +560,11 @@ class OverlayDashboard(QWidget):
         rolling = getattr(self.audio, "rolling_context", "") or CTX.transcript_block(40)
         print(f"[GEMINI STREAM START] ask_ai mode={mode} rolling_chars={len(rolling)}", flush=True)
         self.ai.ask(
-            user_hint=hint,
+            user_hint=hint
+            or (
+                "Answer the LATEST substantive [INTERVIEWER] request now. "
+                "Ignore prior audio checks."
+            ),
             mode=mode,
             include_image=True,
             persist=True,

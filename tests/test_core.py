@@ -141,9 +141,11 @@ def test_markdown_to_html_code_fence() -> None:
 def test_echo_similarity_and_interviewer_prompt() -> None:
     from src.utils.text_similarity import text_similarity
     from src.services.ai_orchestrator import (
+        classify_intent,
         looks_like_chitchat,
         looks_like_interviewer_prompt,
         looks_like_technical_prompt,
+        prompt_mode_for,
     )
 
     a = "write a code in C++ and insert a node in Linux"
@@ -161,6 +163,12 @@ def test_echo_similarity_and_interviewer_prompt() -> None:
     assert looks_like_interviewer_prompt(
         "So can you write the code in C++ to insert the node in linked list?"
     )
+    assert classify_intent("write the code in C++ for a linked list") == "coding"
+    assert classify_intent("design microservices with a load balancer and sharding") == (
+        "technical_discussion"
+    )
+    assert classify_intent("tell me about a time you showed leadership") == "behavioral"
+    assert prompt_mode_for("technical_discussion") == "system_design"
 
 
 def test_auto_ask_does_not_skip_when_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,7 +185,7 @@ def test_auto_ask_does_not_skip_when_streaming(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(orch, "ask", _fake_ask)
     monkeypatch.setattr(ctx_mod.CTX, "is_ai_streaming", True)
 
-    orch._schedule_auto_ask("write C++ code to insert a node in a linked list")
+    orch._schedule_auto_ask("write C++ code to insert a node in a linked list", mode="coding")
     assert orch._debounce_timer is not None
     orch._debounce_timer.cancel()
     # Fire immediately
