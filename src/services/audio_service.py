@@ -44,13 +44,14 @@ class AudioCaptureService:
     ) -> None:
         self.hub = hub
         self.ai = ai
-        self.pipeline = AudioPipeline()
+        self.pipeline = AudioPipeline(hub=hub)
         self.rolling_context: str = ""
         self._wired = False
         self._wire_pipeline()
 
     def set_hub(self, hub: StreamHub) -> None:
         self.hub = hub
+        self.pipeline.set_hub(hub)
 
     def set_ai(self, ai: AIOrchestrator) -> None:
         self.ai = ai

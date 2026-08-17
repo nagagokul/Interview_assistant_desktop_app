@@ -26,6 +26,31 @@ class StreamHub(QObject):
     # Ancillary
     ocr_text = pyqtSignal(str)
     status = pyqtSignal(str)
+    # provider, message, warn, critical, rpm_used, rpm_limit, daily_used, daily_limit
+    api_usage = pyqtSignal(str, str, bool, bool, int, int, int, int)
+
+    def emit_api_usage(
+        self,
+        provider: str,
+        message: str,
+        *,
+        warn: bool,
+        critical: bool,
+        rpm_used: int,
+        rpm_limit: int,
+        daily_used: int,
+        daily_limit: int,
+    ) -> None:
+        self.api_usage.emit(
+            provider,
+            message,
+            warn,
+            critical,
+            rpm_used,
+            rpm_limit,
+            daily_used,
+            daily_limit,
+        )
 
     def emit_transcript(self, speaker: str, text: str) -> None:
         speaker = (speaker or "").strip().lower()

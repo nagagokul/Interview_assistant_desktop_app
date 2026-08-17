@@ -11,8 +11,8 @@ threads never touch Qt widgets directly.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
-from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QMouseEvent, QPalette
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSlot
+from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QMouseEvent, QPalette, QResizeEvent
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.core.api_usage import USAGE
 from src.core.config import CONFIG, save_config
 from src.core.context import CTX
 from src.core.event_bus import BUS, EventType
@@ -43,6 +44,11 @@ from src.ui.snipping_widget import SnippingWidget
 from src.ui.styles import STYLESHEET
 
 log = get_logger("ui")
+
+_RESIZE_MARGIN = 8
+_COLLAPSED_HEIGHT = 42
+_MIN_WIDTH = 360
+_MIN_HEIGHT = 420
 
 
 class OverlayDashboard(QWidget):
@@ -64,6 +70,12 @@ class OverlayDashboard(QWidget):
         self.hub = hub
 
         self._drag_pos = None
+        self._resize_edge: str | None = None
+        self._resize_origin: QPoint | None = None
+        self._resize_geom: QRect | None = None
+        self._collapsed = False
+        self._expanded_size = QSize(max(CONFIG.ui.width, 520), max(CONFIG.ui.height, 900))
+        self._body_widgets: list[QWidget] = []
         self._snip = SnippingWidget()
         self._snip.regionSelected.connect(self._on_region_selected)
         # Auto-ask is owned by AIOrchestrator (triggers on interviewer prompts,
@@ -73,7 +85,8 @@ class OverlayDashboard(QWidget):
         self.ai.set_mode_provider(lambda: self.mode.currentText())
         self.setStyleSheet(STYLESHEET)
         self.setWindowTitle("Interview Copilot")
-        self.resize(max(CONFIG.ui.width, 520), max(CONFIG.ui.height, 900))
+        self.resize(self._expanded_size)
+        self.setMinimumSize(_MIN_WIDTH, _COLLAPSED_HEIGHT)
 
         CTX.opacity = CONFIG.ui.opacity
         if CONFIG.ui.stealth_enabled:
@@ -88,8 +101,10 @@ class OverlayDashboard(QWidget):
         self._sync_stealth_button()
 
         self.setAcceptDrops(True)
+        self.setMouseTracking(True)
         self._apply_window_flags()
         self._wire_stream_hub()
+        self._refresh_usage_labels()
 
         QTimer.singleShot(200, self._init_native)
 
@@ -116,6 +131,7 @@ class OverlayDashboard(QWidget):
         self.hub.ai_error.connect(self._on_ai_error, queued)
         self.hub.ocr_text.connect(self._on_ocr_text, queued)
         self.hub.status.connect(self._on_status, queued)
+        self.hub.api_usage.connect(self._on_api_usage, queued)
         # Intent classifier → dropdown (may emit from worker/timer thread)
         self.ai.mode_changed_signal.connect(self._on_mode_changed, queued)
         print("[UI ROUTE] StreamHub signals connected (QueuedConnection)", flush=True)
@@ -161,19 +177,44 @@ class OverlayDashboard(QWidget):
         self.status = QLabel("Ready")
         self.status.setObjectName("StatusLabel")
         self.btn_hide = QPushButton("Hide")
+        self.btn_hide.setToolTip("Hide overlay (Alt+H) — restore from tray or hotkey")
         self.btn_hide.clicked.connect(self.toggle_visibility)
+        self.btn_min = QPushButton("−")
+        self.btn_min.setObjectName("ChromeButton")
+        self.btn_min.setFixedWidth(28)
+        self.btn_min.setToolTip("Minimize to title bar — click □ to expand again")
+        self.btn_min.clicked.connect(self._toggle_collapsed)
         self.btn_close = QPushButton("✕")
+        self.btn_close.setObjectName("ChromeButton")
         self.btn_close.setFixedWidth(28)
+        self.btn_close.setToolTip("Send to system tray")
         self.btn_close.clicked.connect(self._minimize_to_tray)
         title_row.addWidget(self.title)
         title_row.addStretch()
         title_row.addWidget(self.status)
         title_row.addWidget(self.btn_hide)
+        title_row.addWidget(self.btn_min)
         title_row.addWidget(self.btn_close)
         shell_layout.addLayout(title_row)
 
+        # API free-tier usage meters (Groq STT + Gemini AI)
+        self._usage_host = QWidget()
+        usage_row = QHBoxLayout(self._usage_host)
+        usage_row.setContentsMargins(0, 0, 0, 0)
+        self.usage_groq = QLabel("Groq STT: —")
+        self.usage_groq.setObjectName("UsageOk")
+        self.usage_groq.setToolTip("Groq Whisper free-tier RPM / daily usage")
+        self.usage_gemini = QLabel("Gemini AI: —")
+        self.usage_gemini.setObjectName("UsageOk")
+        self.usage_gemini.setToolTip("Gemini free-tier RPM / daily usage")
+        usage_row.addWidget(self.usage_groq, 1)
+        usage_row.addWidget(self.usage_gemini, 1)
+        shell_layout.addWidget(self._usage_host)
+
         # Controls
-        ctrl = QHBoxLayout()
+        self._ctrl_host = QWidget()
+        ctrl = QHBoxLayout(self._ctrl_host)
+        ctrl.setContentsMargins(0, 0, 0, 0)
         self.btn_listen = QPushButton("Listen")
         self.btn_listen.setObjectName("PrimaryButton")
         self.btn_listen.clicked.connect(self.toggle_listen)
@@ -196,17 +237,19 @@ class OverlayDashboard(QWidget):
             self.btn_clear,
         ):
             ctrl.addWidget(b)
-        shell_layout.addLayout(ctrl)
+        shell_layout.addWidget(self._ctrl_host)
 
         # Opacity
-        op = QHBoxLayout()
+        self._op_host = QWidget()
+        op = QHBoxLayout(self._op_host)
+        op.setContentsMargins(0, 0, 0, 0)
         op.addWidget(QLabel("Opacity"))
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(25, 100)
         self.opacity_slider.setValue(int(CONFIG.ui.opacity * 100))
         self.opacity_slider.valueChanged.connect(self._on_opacity)
         op.addWidget(self.opacity_slider)
-        shell_layout.addLayout(op)
+        shell_layout.addWidget(self._op_host)
 
         # ===== SPLIT VIEW: TOP conversation (30%) / BOTTOM AI (70%) =====
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -218,7 +261,7 @@ class OverlayDashboard(QWidget):
         self.conversation.setMaximumHeight(280)
 
         self.ai_view = AIGuidanceBrowser()
-        self.ai_view.setMinimumHeight(450)
+        self.ai_view.setMinimumHeight(200)
 
         top_wrap = QWidget()
         top_l = QVBoxLayout(top_wrap)
@@ -257,7 +300,9 @@ class OverlayDashboard(QWidget):
         shell_layout.addWidget(self.log_view)
 
         # Ask row — mode auto-updates from intent classifier
-        ask_row = QHBoxLayout()
+        self._ask_host = QWidget()
+        ask_row = QHBoxLayout(self._ask_host)
+        ask_row.setContentsMargins(0, 0, 0, 0)
         self.mode = QComboBox()
         self.mode.addItems(
             ["auto", "coding", "technical_discussion", "behavioral", "debug"]
@@ -274,17 +319,31 @@ class OverlayDashboard(QWidget):
         ask_row.addWidget(self.mode)
         ask_row.addWidget(self.input, 1)
         ask_row.addWidget(self.btn_ask)
-        shell_layout.addLayout(ask_row)
+        shell_layout.addWidget(self._ask_host)
 
-        hint = QLabel(
+        self._hint = QLabel(
             "Hotkeys: Alt+H hide · Alt+S snip · Alt+Enter ask  |  "
-            "Blue = Interviewer · Grey = You · Bottom = AI  |  "
-            "Mode auto-switches from speech · AI re-asks on new interviewer prompts"
+            "− minimizes to title bar  |  drag edges to resize  |  "
+            "Groq/Gemini meters warn before free-tier limits"
         )
-        hint.setObjectName("StatusLabel")
-        shell_layout.addWidget(hint)
+        self._hint.setObjectName("StatusLabel")
+        self._hint.setWordWrap(True)
+        shell_layout.addWidget(self._hint)
 
         root.addWidget(shell)
+        self._shell = shell
+
+        # Widgets hidden when collapsed to title-bar strip
+        self._body_widgets = [
+            self._usage_host,
+            self._ctrl_host,
+            self._op_host,
+            self._main_splitter,
+            self.ocr_view,
+            self.log_view,
+            self._ask_host,
+            self._hint,
+        ]
 
     # ---- stream slots (GUI thread only) ----
 
@@ -368,6 +427,52 @@ class OverlayDashboard(QWidget):
         if any(k in lower for k in ("error", "fail", "missing", "unavailable", "no microphone", "no wasapi")):
             self._append_log(message)
 
+    @pyqtSlot(str, str, bool, bool, int, int, int, int)
+    def _on_api_usage(
+        self,
+        provider: str,
+        message: str,
+        warn: bool,
+        critical: bool,
+        rpm_used: int,
+        rpm_limit: int,
+        daily_used: int,
+        daily_limit: int,
+    ) -> None:
+        short = f"{rpm_used}/{rpm_limit} RPM · {daily_used}/{daily_limit} today"
+        if provider == "groq":
+            label = self.usage_groq
+            label.setText(f"Groq STT: {short}")
+        else:
+            label = self.usage_gemini
+            label.setText(f"Gemini AI: {short}")
+        if critical:
+            label.setObjectName("UsageCritical")
+        elif warn:
+            label.setObjectName("UsageWarn")
+        else:
+            label.setObjectName("UsageOk")
+        # Force stylesheet re-apply after objectName change
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.setToolTip(message)
+        if critical or warn:
+            self._on_status(message)
+            self._append_log(f"USAGE: {message}")
+
+    def _refresh_usage_labels(self) -> None:
+        for snap in USAGE.snapshots():
+            self._on_api_usage(
+                snap.provider,
+                snap.message,
+                snap.warn,
+                snap.critical,
+                snap.rpm_used,
+                snap.rpm_limit,
+                snap.daily_used,
+                snap.daily_limit,
+            )
+
     def _persist_transcript(self, speaker: str, text: str) -> None:
         if not CTX.session_id:
             return
@@ -394,20 +499,126 @@ class OverlayDashboard(QWidget):
             pass
         print("[UI TEXT APPENDED] feeds cleared", flush=True)
 
-    # ---- interactions ----
+    # ---- collapse / resize / drag ----
+
+    def _hit_resize_edge(self, pos: QPoint) -> str | None:
+        if self._collapsed:
+            return None
+        r = self.rect()
+        m = _RESIZE_MARGIN
+        left = pos.x() <= m
+        right = pos.x() >= r.width() - m
+        top = pos.y() <= m
+        bottom = pos.y() >= r.height() - m
+        if top and left:
+            return "tl"
+        if top and right:
+            return "tr"
+        if bottom and left:
+            return "bl"
+        if bottom and right:
+            return "br"
+        if left:
+            return "l"
+        if right:
+            return "r"
+        if top:
+            return "t"
+        if bottom:
+            return "b"
+        return None
+
+    def _cursor_for_edge(self, edge: str | None) -> Qt.CursorShape:
+        mapping = {
+            "l": Qt.CursorShape.SizeHorCursor,
+            "r": Qt.CursorShape.SizeHorCursor,
+            "t": Qt.CursorShape.SizeVerCursor,
+            "b": Qt.CursorShape.SizeVerCursor,
+            "tl": Qt.CursorShape.SizeFDiagCursor,
+            "br": Qt.CursorShape.SizeFDiagCursor,
+            "tr": Qt.CursorShape.SizeBDiagCursor,
+            "bl": Qt.CursorShape.SizeBDiagCursor,
+        }
+        return mapping.get(edge or "", Qt.CursorShape.ArrowCursor)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            local = event.position().toPoint()
+            edge = self._hit_resize_edge(local)
+            if edge:
+                self._resize_edge = edge
+                self._resize_origin = event.globalPosition().toPoint()
+                self._resize_geom = self.geometry()
+                self._drag_pos = None
+                event.accept()
+                return
+            self._resize_edge = None
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._resize_edge and self._resize_origin is not None and self._resize_geom is not None:
+            delta = event.globalPosition().toPoint() - self._resize_origin
+            g = QRect(self._resize_geom)
+            edge = self._resize_edge
+            if "l" in edge:
+                g.setLeft(g.left() + delta.x())
+            if "r" in edge:
+                g.setRight(g.right() + delta.x())
+            if "t" in edge:
+                g.setTop(g.top() + delta.y())
+            if "b" in edge:
+                g.setBottom(g.bottom() + delta.y())
+            if g.width() < _MIN_WIDTH:
+                if "l" in edge:
+                    g.setLeft(g.right() - _MIN_WIDTH)
+                else:
+                    g.setWidth(_MIN_WIDTH)
+            min_h = _COLLAPSED_HEIGHT if self._collapsed else _MIN_HEIGHT
+            if g.height() < min_h:
+                if "t" in edge:
+                    g.setTop(g.bottom() - min_h)
+                else:
+                    g.setHeight(min_h)
+            self.setGeometry(g)
+            event.accept()
+            return
+
         if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
             event.accept()
+            return
+
+        edge = self._hit_resize_edge(event.position().toPoint())
+        self.setCursor(self._cursor_for_edge(edge))
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._resize_edge and not self._collapsed:
+            self._expanded_size = self.size()
+            CONFIG.ui.width = self.width()
+            CONFIG.ui.height = self.height()
+            try:
+                save_config(CONFIG)
+            except Exception:  # noqa: BLE001
+                pass
         self._drag_pos = None
+        self._resize_edge = None
+        self._resize_origin = None
+        self._resize_geom = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        # Double-click title area toggles collapsed title-bar mode
+        if event.position().y() <= 40:
+            self._toggle_collapsed()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if not self._collapsed:
+            self._expanded_size = self.size()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
@@ -440,9 +651,53 @@ class OverlayDashboard(QWidget):
         self.raise_()
         self._sync_stealth_button()
 
+    def _toggle_collapsed(self) -> None:
+        if self._collapsed:
+            self._expand_from_titlebar()
+        else:
+            self._collapse_to_titlebar()
+
+    def _collapse_to_titlebar(self) -> None:
+        """Shrink to a slim always-on-top title strip with restore control."""
+        if self._collapsed:
+            return
+        self._expanded_size = self.size()
+        self._collapsed = True
+        for w in self._body_widgets:
+            w.hide()
+        self.btn_min.setText("□")
+        self.btn_min.setToolTip("Expand overlay")
+        self.title.setText("Interview Copilot — click □ to expand")
+        self.setMinimumHeight(_COLLAPSED_HEIGHT)
+        self.setMaximumHeight(_COLLAPSED_HEIGHT + 8)
+        self.resize(max(self.width(), _MIN_WIDTH), _COLLAPSED_HEIGHT)
+        self._on_status("Minimized to title bar")
+        print("[UI] collapsed to title bar", flush=True)
+
+    def _expand_from_titlebar(self) -> None:
+        if not self._collapsed:
+            return
+        self._collapsed = False
+        self.setMaximumHeight(16777215)
+        self.setMinimumHeight(_MIN_HEIGHT)
+        for w in self._body_widgets:
+            w.show()
+        self.btn_min.setText("−")
+        self.btn_min.setToolTip("Minimize to title bar — click □ to expand again")
+        self.title.setText("Interview Copilot")
+        target = self._expanded_size
+        self.resize(
+            max(target.width(), _MIN_WIDTH),
+            max(target.height(), _MIN_HEIGHT),
+        )
+        self._refresh_usage_labels()
+        self._on_status("Expanded")
+        print("[UI] expanded from title bar", flush=True)
+
     def _minimize_to_tray(self) -> None:
         self.hide()
         CTX.overlay_visible = False
+        self._on_status("In system tray — click tray icon to restore")
 
     def toggle_listen(self) -> None:
         if self.audio.running:
@@ -517,6 +772,8 @@ class OverlayDashboard(QWidget):
         CONFIG.ui.stealth_enabled = False
         save_config(CONFIG)
         self._sync_stealth_button()
+        if self._collapsed:
+            self._expand_from_titlebar()
         self.show()
         self.raise_()
         self.activateWindow()

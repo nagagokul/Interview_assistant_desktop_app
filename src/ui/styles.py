@@ -54,6 +54,33 @@ QPushButton#PrimaryButton {
     border-color: rgba(120, 160, 220, 120);
 }
 
+QPushButton#ChromeButton {
+    min-height: 22px;
+    padding: 2px 6px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+QLabel#UsageOk {
+    font-size: 11px;
+    color: #8B9BB4;
+    padding: 2px 4px;
+}
+
+QLabel#UsageWarn {
+    font-size: 11px;
+    color: #E6C35C;
+    padding: 2px 4px;
+    font-weight: 600;
+}
+
+QLabel#UsageCritical {
+    font-size: 11px;
+    color: #FF8A80;
+    padding: 2px 4px;
+    font-weight: 700;
+}
+
 QSlider::groove:horizontal {
     height: 4px;
     background: rgba(70, 85, 110, 160);
