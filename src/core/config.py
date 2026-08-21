@@ -57,6 +57,16 @@ class AIConfig:
     max_output_tokens: int = 2048
     stream: bool = True
     system_prompt_file: str = "system_interview.txt"
+    # Free-tier style caps (Groq on_demand whisper = 20 RPM from API errors)
+    groq_rpm_limit: int = 20
+    groq_daily_limit: int = 1_440  # ~20 RPM sustained over a day (soft guide)
+    gemini_rpm_limit: int = 15
+    gemini_daily_limit: int = 250
+    usage_warn_ratio: float = 0.75
+    usage_critical_ratio: float = 0.90
+    # Transient API resilience
+    gemini_max_retries: int = 3
+    groq_max_retries: int = 4
 
 
 # Shut-down / retired model ids → current Flash alias (Aug 2026+)
@@ -190,6 +200,28 @@ def load_config() -> AppConfig:
         cfg.ai.gemini_model = model
     if model := os.environ.get("GROQ_WHISPER_MODEL"):
         cfg.ai.groq_model = model
+
+    # Optional free-tier meter overrides
+    if v := os.environ.get("GROQ_RPM_LIMIT"):
+        try:
+            cfg.ai.groq_rpm_limit = int(v)
+        except ValueError:
+            pass
+    if v := os.environ.get("GROQ_DAILY_LIMIT"):
+        try:
+            cfg.ai.groq_daily_limit = int(v)
+        except ValueError:
+            pass
+    if v := os.environ.get("GEMINI_RPM_LIMIT"):
+        try:
+            cfg.ai.gemini_rpm_limit = int(v)
+        except ValueError:
+            pass
+    if v := os.environ.get("GEMINI_DAILY_LIMIT"):
+        try:
+            cfg.ai.gemini_daily_limit = int(v)
+        except ValueError:
+            pass
 
     # Remap retired models (e.g. gemini-1.5-flash → gemini-flash-latest)
     cfg.ai.gemini_model = normalize_gemini_model(cfg.ai.gemini_model)

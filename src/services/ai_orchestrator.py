@@ -33,12 +33,19 @@ except ImportError:  # headless / unit-test environments without PyQt6 wheels
     def pyqtSignal(*_a: Any, **_k: Any) -> _DummySignal:  # type: ignore[misc]
         return _DummySignal()
 
+from src.core.api_usage import USAGE
 from src.core.config import CONFIG, GEMINI_MODEL_FALLBACKS, normalize_gemini_model
 from src.core.context import CTX
 from src.core.event_bus import BUS, EventType
 from src.core.logging_setup import get_logger
 from src.core.paths import prompts_dir
 from src.data.database import get_db
+from src.utils.api_retry import (
+    format_api_error,
+    is_not_found_model_error,
+    is_transient_api_error,
+    parse_retry_after_seconds,
+)
 
 if TYPE_CHECKING:
     from src.core.stream_hub import StreamHub
@@ -694,6 +701,40 @@ class AIOrchestrator(QObject):
         else:
             yield from self._stream_legacy(client, prompt, image_jpeg)
 
+    def _emit_usage(self) -> None:
+        snap = USAGE.record("gemini")
+        if self.hub:
+            try:
+                self.hub.emit_api_usage(
+                    snap.provider,
+                    snap.message,
+                    warn=snap.warn,
+                    critical=snap.critical,
+                    rpm_used=snap.rpm_used,
+                    rpm_limit=snap.rpm_limit,
+                    daily_used=snap.daily_used,
+                    daily_limit=snap.daily_limit,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if snap.critical or snap.warn:
+            if self.hub:
+                self.hub.emit_status(snap.message)
+
+    def _wait_for_gemini_slot(self) -> None:
+        """Soft throttle when local free-tier RPM meter is near the cap."""
+        wait = USAGE.seconds_until_rpm_slot("gemini")
+        if wait <= 0:
+            return
+        msg = f"Gemini free RPM nearly exhausted — waiting {wait:.1f}s…"
+        print(f"[API USAGE WARN] {msg}", flush=True)
+        if self.hub:
+            self.hub.emit_status(msg)
+        # Cap wait so a cancelled stream can exit
+        end = time.time() + min(wait, 45.0)
+        while time.time() < end and not self._cancel.is_set():
+            time.sleep(0.15)
+
     def _stream_google_genai(
         self, client: Any, prompt: str, image_jpeg: bytes | None
     ) -> Generator[str, None, None]:
@@ -716,34 +757,74 @@ class AIOrchestrator(QObject):
             if n not in candidates:
                 candidates.append(n)
 
+        max_retries = max(1, int(getattr(self.config, "gemini_max_retries", 3)))
         last_exc: Exception | None = None
         for model_name in candidates:
-            try:
-                print(f"[GEMINI STREAM START] model={model_name}", flush=True)
-                response = client.models.generate_content_stream(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
-                )
-                # Commit working model so later turns skip dead ids
-                if model_name != self.config.gemini_model:
-                    log.info("Gemini model fallback engaged: %s → %s", self.config.gemini_model, model_name)
-                    self.config.gemini_model = model_name
-                for chunk in response:
+            for attempt in range(max_retries):
+                if self._cancel.is_set():
+                    return
+                try:
+                    self._wait_for_gemini_slot()
                     if self._cancel.is_set():
+                        return
+                    print(
+                        f"[GEMINI STREAM START] model={model_name} attempt={attempt + 1}/{max_retries}",
+                        flush=True,
+                    )
+                    response = client.models.generate_content_stream(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                    # Commit working model so later turns skip dead ids
+                    if model_name != self.config.gemini_model:
+                        log.info(
+                            "Gemini model fallback engaged: %s → %s",
+                            self.config.gemini_model,
+                            model_name,
+                        )
+                        self.config.gemini_model = model_name
+                    yielded = False
+                    for chunk in response:
+                        if self._cancel.is_set():
+                            break
+                        text = getattr(chunk, "text", None)
+                        if text:
+                            if not yielded:
+                                self._emit_usage()
+                                yielded = True
+                            yield text
+                    if not yielded:
+                        # Empty but successful stream still counts as an attempt
+                        self._emit_usage()
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    print(f"[GEMINI STREAM START] model={model_name} failed: {exc}", flush=True)
+                    if is_not_found_model_error(exc):
+                        break  # try next model id
+                    if is_transient_api_error(exc) and attempt + 1 < max_retries:
+                        delay = parse_retry_after_seconds(exc, default=1.5 * (attempt + 1))
+                        delay = min(max(delay, 0.5), 20.0)
+                        msg = format_api_error("Gemini", exc)
+                        print(
+                            f"[GEMINI STREAM START] transient — retry in {delay:.1f}s ({msg})",
+                            flush=True,
+                        )
+                        if self.hub:
+                            self.hub.emit_status(f"{msg} (retry {attempt + 2}/{max_retries})")
+                        # On 503 also try next fallback model after a short wait
+                        end = time.time() + delay
+                        while time.time() < end and not self._cancel.is_set():
+                            time.sleep(0.1)
+                        # Prefer falling through to another model after first 503
+                        if "503" in str(exc) or "unavailable" in str(exc).lower():
+                            break
+                        continue
+                    # Non-retryable for this model — try next candidate if transient
+                    if is_transient_api_error(exc):
                         break
-                    text = getattr(chunk, "text", None)
-                    if text:
-                        yield text
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                msg = str(exc)
-                not_found = "404" in msg or "NOT_FOUND" in msg or "not found" in msg.lower()
-                print(f"[GEMINI STREAM START] model={model_name} failed: {exc}", flush=True)
-                if not_found:
-                    continue
-                raise RuntimeError(f"generate_content_stream failed: {exc}") from exc
+                    raise RuntimeError(f"generate_content_stream failed: {exc}") from exc
 
         raise RuntimeError(f"generate_content_stream failed: {last_exc}") from last_exc
 
@@ -757,7 +838,7 @@ class AIOrchestrator(QObject):
 
             content.insert(0, Image.open(io.BytesIO(image_jpeg)))
 
-        # Legacy path: recreate GenerativeModel with fallbacks on 404
+        # Legacy path: recreate GenerativeModel with fallbacks on 404 / 503
         import google.generativeai as genai_legacy
 
         primary = normalize_gemini_model(self.config.gemini_model)
@@ -767,43 +848,63 @@ class AIOrchestrator(QObject):
             if n not in candidates:
                 candidates.append(n)
 
+        max_retries = max(1, int(getattr(self.config, "gemini_max_retries", 3)))
         last_exc: Exception | None = None
         for model_name in candidates:
-            try:
-                active = model
-                if normalize_gemini_model(getattr(model, "model_name", "") or "") != model_name:
-                    active = genai_legacy.GenerativeModel(
-                        model_name=model_name,
-                        system_instruction=_load_system_prompt(),
+            for attempt in range(max_retries):
+                if self._cancel.is_set():
+                    return
+                try:
+                    self._wait_for_gemini_slot()
+                    active = model
+                    if normalize_gemini_model(getattr(model, "model_name", "") or "") != model_name:
+                        active = genai_legacy.GenerativeModel(
+                            model_name=model_name,
+                            system_instruction=_load_system_prompt(),
+                        )
+                    stream = active.generate_content(
+                        content,
+                        stream=True,
+                        generation_config={
+                            "temperature": self.config.temperature,
+                            "max_output_tokens": self.config.max_output_tokens,
+                        },
                     )
-                stream = active.generate_content(
-                    content,
-                    stream=True,
-                    generation_config={
-                        "temperature": self.config.temperature,
-                        "max_output_tokens": self.config.max_output_tokens,
-                    },
-                )
-                if model_name != self.config.gemini_model:
-                    self.config.gemini_model = model_name
-                    self._client = ("legacy", active)
-                for chunk in stream:
-                    if self._cancel.is_set():
+                    if model_name != self.config.gemini_model:
+                        self.config.gemini_model = model_name
+                        self._client = ("legacy", active)
+                    yielded = False
+                    for chunk in stream:
+                        if self._cancel.is_set():
+                            break
+                        try:
+                            text = chunk.text
+                        except Exception:  # noqa: BLE001
+                            text = ""
+                        if text:
+                            if not yielded:
+                                self._emit_usage()
+                                yielded = True
+                            yield text
+                    if not yielded:
+                        self._emit_usage()
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if is_not_found_model_error(exc):
                         break
-                    try:
-                        text = chunk.text
-                    except Exception:  # noqa: BLE001
-                        text = ""
-                    if text:
-                        yield text
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                msg = str(exc)
-                not_found = "404" in msg or "NOT_FOUND" in msg or "not found" in msg.lower()
-                if not_found:
-                    continue
-                raise RuntimeError(f"legacy generate_content failed: {exc}") from exc
+                    if is_transient_api_error(exc) and attempt + 1 < max_retries:
+                        delay = parse_retry_after_seconds(exc, default=1.5 * (attempt + 1))
+                        delay = min(max(delay, 0.5), 20.0)
+                        end = time.time() + delay
+                        while time.time() < end and not self._cancel.is_set():
+                            time.sleep(0.1)
+                        if "503" in str(exc) or "unavailable" in str(exc).lower():
+                            break
+                        continue
+                    if is_transient_api_error(exc):
+                        break
+                    raise RuntimeError(f"legacy generate_content failed: {exc}") from exc
 
         raise RuntimeError(f"legacy generate_content failed: {last_exc}") from last_exc
 

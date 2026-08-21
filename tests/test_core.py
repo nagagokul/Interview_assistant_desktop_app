@@ -308,3 +308,114 @@ def test_normalize_gemini_model_remaps_retired_ids() -> None:
     assert normalize_gemini_model("gemini-2.0-flash") == "gemini-flash-latest"
     assert normalize_gemini_model("gemini-3.5-flash") == "gemini-3.5-flash"
     assert AIConfig().gemini_model == "gemini-flash-latest"
+
+
+def test_api_retry_helpers_parse_transient_and_retry_after() -> None:
+    from src.utils.api_retry import (
+        is_not_found_model_error,
+        is_transient_api_error,
+        parse_retry_after_seconds,
+    )
+
+    assert is_transient_api_error("503 UNAVAILABLE high demand") is True
+    assert is_transient_api_error("Error code: 429 - Rate limit reached") is True
+    assert is_transient_api_error("permission denied") is False
+    assert is_not_found_model_error("404 NOT_FOUND model") is True
+    assert parse_retry_after_seconds("Please try again in 3s.", default=1.0) == 3.0
+    assert parse_retry_after_seconds("retry after 1500 ms", default=1.0) == 1.5
+
+
+def test_api_usage_tracker_warns_near_free_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.core import api_usage as usage_mod
+    from src.core.config import CONFIG
+
+    monkeypatch.setattr(CONFIG.ai, "groq_rpm_limit", 10)
+    monkeypatch.setattr(CONFIG.ai, "groq_daily_limit", 100)
+    monkeypatch.setattr(CONFIG.ai, "usage_warn_ratio", 0.7)
+    monkeypatch.setattr(CONFIG.ai, "usage_critical_ratio", 0.9)
+
+    tracker = usage_mod.ApiUsageTracker()
+    for _ in range(7):
+        snap = tracker.record("groq")
+    assert snap.rpm_used == 7
+    assert snap.warn is True
+    assert snap.critical is False
+
+    for _ in range(3):
+        snap = tracker.record("groq")
+    assert snap.rpm_used == 10
+    assert snap.critical is True
+    assert tracker.would_exceed_rpm("groq") is True
+    assert tracker.seconds_until_rpm_slot("groq") > 0
+
+
+def test_gemini_stream_retries_transient_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """503 UNAVAILABLE should retry / fall back instead of failing immediately."""
+    import sys
+    import types as pytypes
+
+    from src.services.ai_orchestrator import AIOrchestrator
+    from src.core.config import CONFIG
+
+    # Stub google.genai.types so the stream path can load without the SDK installed
+    google_mod = pytypes.ModuleType("google")
+    genai_mod = pytypes.ModuleType("google.genai")
+    types_mod = pytypes.ModuleType("google.genai.types")
+
+    class _Part:
+        @staticmethod
+        def from_text(text):
+            return {"text": text}
+
+        @staticmethod
+        def from_bytes(data, mime_type):
+            return {"data": data, "mime": mime_type}
+
+    class _Content:
+        def __init__(self, role, parts):
+            self.role = role
+            self.parts = parts
+
+    class _GenerateContentConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    types_mod.Part = _Part
+    types_mod.Content = _Content
+    types_mod.GenerateContentConfig = _GenerateContentConfig
+    genai_mod.types = types_mod
+    google_mod.genai = genai_mod
+    monkeypatch.setitem(sys.modules, "google", google_mod)
+    monkeypatch.setitem(sys.modules, "google.genai", genai_mod)
+    monkeypatch.setitem(sys.modules, "google.genai.types", types_mod)
+
+    monkeypatch.setattr(CONFIG.ai, "gemini_max_retries", 2)
+    monkeypatch.setattr(CONFIG.ai, "gemini_model", "gemini-flash-latest")
+    monkeypatch.setattr("src.services.ai_orchestrator.time.sleep", lambda *_a, **_k: None)
+
+    orch = AIOrchestrator(hub=None)
+    calls = {"n": 0}
+
+    class _FakeModels:
+        def generate_content_stream(self, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError(
+                    "503 UNAVAILABLE. {'error': {'message': 'high demand', 'status': 'UNAVAILABLE'}}"
+                )
+
+            class _Chunk:
+                text = "ok-answer"
+
+            yield _Chunk()
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    monkeypatch.setattr(orch, "_ensure_client", lambda: ("genai", _FakeClient()))
+    monkeypatch.setattr(orch, "_wait_for_gemini_slot", lambda: None)
+    monkeypatch.setattr(orch, "_emit_usage", lambda: None)
+
+    out = "".join(orch._stream_tokens("prompt", None))
+    assert out == "ok-answer"
+    assert calls["n"] >= 2

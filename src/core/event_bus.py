@@ -16,6 +16,7 @@ class EventType(str, Enum):
     AI_TOKEN = "ai_token"
     AI_COMPLETE = "ai_complete"
     AI_ERROR = "ai_error"
+    API_USAGE = "api_usage"
     STATUS = "status"
     STEALTH_CHANGED = "stealth_changed"
     OPACITY_CHANGED = "opacity_changed"

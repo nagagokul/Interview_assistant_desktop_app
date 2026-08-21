@@ -21,8 +21,10 @@ from typing import Any
 import numpy as np
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+from src.core.api_usage import USAGE
 from src.core.config import CONFIG, AudioConfig
 from src.core.logging_setup import get_logger
+from src.utils.api_retry import is_transient_api_error, parse_retry_after_seconds
 from src.utils.audio_devices import resolve_loopback_device, resolve_mic_device
 from src.utils.text_similarity import text_similarity
 from src.utils.vad import RingPCMBuffer, VoiceActivityDetector, pcm16_to_wav
@@ -45,6 +47,10 @@ class GroqWhisperClient:
         self.api_key = api_key
         self.model = model
         self._client: Any = None
+        self._hub: Any = None
+
+    def set_hub(self, hub: Any) -> None:
+        self._hub = hub
 
     def _client_or_raise(self) -> Any:
         if not self.api_key:
@@ -55,30 +61,88 @@ class GroqWhisperClient:
             self._client = Groq(api_key=self.api_key)
         return self._client
 
+    def _emit_usage(self) -> None:
+        snap = USAGE.record("groq")
+        hub = self._hub
+        if hub is not None:
+            try:
+                hub.emit_api_usage(
+                    snap.provider,
+                    snap.message,
+                    warn=snap.warn,
+                    critical=snap.critical,
+                    rpm_used=snap.rpm_used,
+                    rpm_limit=snap.rpm_limit,
+                    daily_used=snap.daily_used,
+                    daily_limit=snap.daily_limit,
+                )
+                if snap.warn or snap.critical:
+                    hub.emit_status(snap.message)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _wait_for_slot(self) -> None:
+        wait = USAGE.seconds_until_rpm_slot("groq")
+        if wait <= 0:
+            return
+        msg = f"Groq Whisper free RPM nearly exhausted — waiting {wait:.1f}s…"
+        print(f"[API USAGE WARN] {msg}", flush=True)
+        if self._hub is not None:
+            try:
+                self._hub.emit_status(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(min(wait, 45.0))
+
     def transcribe(self, wav_bytes: bytes, tag: str) -> str:
         client = self._client_or_raise()
-        bio = io.BytesIO(wav_bytes)
-        bio.name = f"{tag}.wav"
-        t0 = time.perf_counter()
-        try:
-            result = client.audio.transcriptions.create(
-                file=(f"{tag}.wav", bio, "audio/wav"),
-                model=self.model,
-                response_format="text",
-                temperature=0.0,
-                language="en",
+        max_retries = max(1, int(getattr(CONFIG.ai, "groq_max_retries", 4)))
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            bio = io.BytesIO(wav_bytes)
+            bio.name = f"{tag}.wav"
+            t0 = time.perf_counter()
+            try:
+                self._wait_for_slot()
+                result = client.audio.transcriptions.create(
+                    file=(f"{tag}.wav", bio, "audio/wav"),
+                    model=self.model,
+                    response_format="text",
+                    temperature=0.0,
+                    language="en",
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                print(f"[PIPELINE ERROR] Groq Whisper failed tag={tag} err={exc}", flush=True)
+                if is_transient_api_error(exc) and attempt + 1 < max_retries:
+                    delay = parse_retry_after_seconds(exc, default=3.0 * (attempt + 1))
+                    delay = min(max(delay, 0.5), 30.0)
+                    print(
+                        f"[PIPELINE ERROR] Groq 429/503 — retry in {delay:.1f}s "
+                        f"({attempt + 1}/{max_retries})",
+                        flush=True,
+                    )
+                    if self._hub is not None:
+                        try:
+                            self._hub.emit_status(
+                                f"Groq rate limit — retrying in {delay:.0f}s "
+                                f"({attempt + 2}/{max_retries})"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    time.sleep(delay)
+                    continue
+                raise
+            text = result if isinstance(result, str) else getattr(result, "text", str(result))
+            text = (text or "").strip()
+            ms = (time.perf_counter() - t0) * 1000
+            self._emit_usage()
+            print(
+                f"[GROQ TRANSCRIPT RECEIVED] tag={tag} ms={ms:.0f} text={text[:160]!r}",
+                flush=True,
             )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[PIPELINE ERROR] Groq Whisper failed tag={tag} err={exc}", flush=True)
-            raise
-        text = result if isinstance(result, str) else getattr(result, "text", str(result))
-        text = (text or "").strip()
-        ms = (time.perf_counter() - t0) * 1000
-        print(
-            f"[GROQ TRANSCRIPT RECEIVED] tag={tag} ms={ms:.0f} text={text[:160]!r}",
-            flush=True,
-        )
-        return text
+            return text
+        raise RuntimeError(f"Groq Whisper failed after retries: {last_exc}") from last_exc
 
 
 class _CaptureWorker(QThread):
@@ -366,10 +430,13 @@ class AudioPipeline(QObject):
     pipeline_error = pyqtSignal(str)
     pipeline_status = pyqtSignal(str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, hub: Any = None) -> None:
         super().__init__(parent)
         self.config = CONFIG.audio
         self.whisper = GroqWhisperClient(CONFIG.groq_api_key, CONFIG.ai.groq_model)
+        if hub is not None:
+            self.whisper.set_hub(hub)
+        self._hub = hub
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="whisper")
         self._mic_thread: _CaptureWorker | None = None
         self._loop_thread: _CaptureWorker | None = None
@@ -379,6 +446,10 @@ class AudioPipeline(QObject):
         self._recent_interviewer: list[tuple[float, str]] = []
         self.echo_similarity_threshold = 0.82
         self.echo_window_sec = 12.0
+
+    def set_hub(self, hub: Any) -> None:
+        self._hub = hub
+        self.whisper.set_hub(hub)
 
     @property
     def running(self) -> bool:
