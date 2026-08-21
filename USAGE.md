@@ -80,7 +80,7 @@ Terminal verification logs (watch these if text does not appear):
 | `Alt+Enter` | Ask AI using current context |
 | `Esc` | Cancel snipping (while the snip overlay is open) |
 
-Drag the overlay by clicking the title area. Use the tray icon → **Quit** to exit cleanly.
+Drag the overlay by clicking the title area. Use the overlay **✕** close button or the tray icon → **Quit** to exit cleanly. **Hide** / Alt+H only conceals the overlay (tray keeps running).
 
 ---
 
