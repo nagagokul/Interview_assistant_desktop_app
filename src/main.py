@@ -104,9 +104,11 @@ def main() -> int:
         log.info("Quit requested")
         hotkeys.stop()
         dashboard.shutdown()
+        tray.hide()
         app.quit()
 
     tray.action_quit.triggered.connect(_quit)
+    dashboard.quitRequested.connect(_quit)
     tray.activated.connect(
         lambda reason: dashboard.toggle_visibility()
         if reason == tray.ActivationReason.Trigger

@@ -419,3 +419,19 @@ def test_gemini_stream_retries_transient_503(monkeypatch: pytest.MonkeyPatch) ->
     out = "".join(orch._stream_tokens("prompt", None))
     assert out == "ok-answer"
     assert calls["n"] >= 2
+
+
+def test_close_button_requests_quit_not_tray() -> None:
+    """Regression: overlay ✕ must quit the app, not only hide to the tray."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    dashboard = (root / "src" / "ui" / "ui_dashboard.py").read_text(encoding="utf-8")
+    main = (root / "src" / "main.py").read_text(encoding="utf-8")
+
+    assert "quitRequested = pyqtSignal()" in dashboard
+    assert "btn_close.clicked.connect(self._request_quit)" in dashboard
+    assert "self.quitRequested.emit()" in dashboard
+    assert "_minimize_to_tray" not in dashboard
+    assert "dashboard.quitRequested.connect(_quit)" in main
+    assert "tray.hide()" in main

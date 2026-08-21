@@ -11,7 +11,7 @@ threads never touch Qt widgets directly.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSlot
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QMouseEvent, QPalette, QResizeEvent
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -52,6 +52,10 @@ _MIN_HEIGHT = 420
 
 
 class OverlayDashboard(QWidget):
+    """Frameless overlay. Emit quitRequested so main can stop services and exit."""
+
+    quitRequested = pyqtSignal()
+
     def __init__(
         self,
         audio: AudioCaptureService,
@@ -187,8 +191,8 @@ class OverlayDashboard(QWidget):
         self.btn_close = QPushButton("✕")
         self.btn_close.setObjectName("ChromeButton")
         self.btn_close.setFixedWidth(28)
-        self.btn_close.setToolTip("Send to system tray")
-        self.btn_close.clicked.connect(self._minimize_to_tray)
+        self.btn_close.setToolTip("Quit Interview Copilot")
+        self.btn_close.clicked.connect(self._request_quit)
         title_row.addWidget(self.title)
         title_row.addStretch()
         title_row.addWidget(self.status)
@@ -323,7 +327,7 @@ class OverlayDashboard(QWidget):
 
         self._hint = QLabel(
             "Hotkeys: Alt+H hide · Alt+S snip · Alt+Enter ask  |  "
-            "− minimizes to title bar  |  drag edges to resize  |  "
+            "− title bar  ·  ✕ quit  |  drag edges to resize  |  "
             "Groq/Gemini meters warn before free-tier limits"
         )
         self._hint.setObjectName("StatusLabel")
@@ -694,10 +698,11 @@ class OverlayDashboard(QWidget):
         self._on_status("Expanded")
         print("[UI] expanded from title bar", flush=True)
 
-    def _minimize_to_tray(self) -> None:
-        self.hide()
-        CTX.overlay_visible = False
-        self._on_status("In system tray — click tray icon to restore")
+    def _request_quit(self) -> None:
+        """Close (✕) ends the process — Hide / tray still hide the overlay only."""
+        self._on_status("Quitting…")
+        print("[UI] close button → quitRequested", flush=True)
+        self.quitRequested.emit()
 
     def toggle_listen(self) -> None:
         if self.audio.running:
